@@ -8,6 +8,19 @@ package legate where
 lean_lib Legate where
   roots := #[`Legate]
 
+-- Tests library - modules that contain the actual tests
+lean_lib Tests where
+  srcDir := "."
+  roots := #[`Tests.Framework, `Tests.ErrorTests, `Tests.MetadataTests, `Tests.StatusTests]
+  moreLinkArgs := #["-L.lake/build/lib", "-lLegate"]
+
+-- Test executable (build tests and run with `lake test`)
+@[test_driver]
+lean_exe tests where
+  root := `Tests.Main
+  srcDir := "."
+  moreLinkArgs := #["-L.lake/build/lib", "-lLegate", "-lTests"]
+
 /-- Build script that invokes CMake to build the FFI library -/
 script buildFfi do
   -- Get Lean sysroot
