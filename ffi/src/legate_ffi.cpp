@@ -1,0 +1,920 @@
+#include "legate_ffi.h"
+
+#include <grpcpp/grpcpp.h>
+#include <grpcpp/generic/generic_stub.h>
+#include <grpcpp/generic/async_generic_service.h>
+#include <grpc/byte_buffer_reader.h>
+
+#include <memory>
+#include <mutex>
+#include <condition_variable>
+#include <string>
+#include <vector>
+#include <unordered_map>
+#include <thread>
+#include <atomic>
+#include <chrono>
+
+// ============================================================================
+// External Class Registration
+// ============================================================================
+
+static lean_external_class* g_channel_class = nullptr;
+static lean_external_class* g_client_stream_class = nullptr;
+static lean_external_class* g_server_stream_class = nullptr;
+static lean_external_class* g_bidi_stream_class = nullptr;
+static lean_external_class* g_server_builder_class = nullptr;
+static lean_external_class* g_server_class = nullptr;
+
+static std::mutex g_init_mutex;
+static std::atomic<bool> g_initialized{false};
+
+// ============================================================================
+// Wrapper Types
+// ============================================================================
+
+// Channel wrapper with GenericStub for making calls
+struct ChannelWrapper {
+    std::shared_ptr<grpc::Channel> channel;
+    std::unique_ptr<grpc::GenericStub> stub;
+
+    explicit ChannelWrapper(std::shared_ptr<grpc::Channel> ch)
+        : channel(std::move(ch))
+        , stub(std::make_unique<grpc::GenericStub>(channel)) {}
+};
+
+// Base class for stream wrappers
+struct StreamWrapperBase {
+    std::unique_ptr<grpc::ClientContext> context;
+    grpc::Status status;
+    std::multimap<grpc::string_ref, grpc::string_ref> trailing_metadata;
+
+    StreamWrapperBase() : context(std::make_unique<grpc::ClientContext>()) {}
+    virtual ~StreamWrapperBase() = default;
+};
+
+// Client streaming call wrapper
+struct ClientStreamWrapper : StreamWrapperBase {
+    std::unique_ptr<grpc::GenericClientAsyncWriter> writer;
+    grpc::ByteBuffer response;
+    grpc::CompletionQueue cq;
+    bool writes_done = false;
+};
+
+// Server streaming call wrapper
+struct ServerStreamWrapper : StreamWrapperBase {
+    std::unique_ptr<grpc::GenericClientAsyncReader> reader;
+    grpc::CompletionQueue cq;
+    bool finished = false;
+};
+
+// Bidirectional streaming call wrapper
+struct BidiStreamWrapper : StreamWrapperBase {
+    std::unique_ptr<grpc::GenericClientAsyncReaderWriter> stream;
+    grpc::CompletionQueue cq;
+    bool writes_done = false;
+    bool read_finished = false;
+};
+
+// Server-side types
+struct RegisteredHandler {
+    std::string method;
+    uint8_t handler_type;  // 0=unary, 1=client, 2=server, 3=bidi
+    lean_object* handler;  // Lean closure (inc-refed)
+};
+
+struct ServerBuilderWrapper {
+    std::unique_ptr<grpc::ServerBuilder> builder;
+    std::vector<RegisteredHandler> handlers;
+    grpc::AsyncGenericService service;
+    int selected_port = 0;
+
+    ServerBuilderWrapper() : builder(std::make_unique<grpc::ServerBuilder>()) {
+        builder->RegisterAsyncGenericService(&service);
+    }
+};
+
+struct ServerWrapper {
+    std::unique_ptr<grpc::Server> server;
+    std::unique_ptr<grpc::ServerCompletionQueue> cq;
+    std::vector<RegisteredHandler> handlers;
+    std::thread polling_thread;
+    std::atomic<bool> running{false};
+
+    ~ServerWrapper() {
+        if (running.load()) {
+            server->Shutdown();
+            cq->Shutdown();
+            if (polling_thread.joinable()) {
+                polling_thread.join();
+            }
+        }
+        // Dec-ref all handlers
+        for (auto& h : handlers) {
+            if (h.handler) {
+                lean_dec(h.handler);
+            }
+        }
+    }
+};
+
+// ============================================================================
+// Finalizers for Lean GC
+// ============================================================================
+
+static void channel_finalizer(void* ptr) {
+    delete static_cast<ChannelWrapper*>(ptr);
+}
+
+static void client_stream_finalizer(void* ptr) {
+    delete static_cast<ClientStreamWrapper*>(ptr);
+}
+
+static void server_stream_finalizer(void* ptr) {
+    delete static_cast<ServerStreamWrapper*>(ptr);
+}
+
+static void bidi_stream_finalizer(void* ptr) {
+    delete static_cast<BidiStreamWrapper*>(ptr);
+}
+
+static void server_builder_finalizer(void* ptr) {
+    auto* wrapper = static_cast<ServerBuilderWrapper*>(ptr);
+    // Dec-ref handlers
+    for (auto& h : wrapper->handlers) {
+        if (h.handler) {
+            lean_dec(h.handler);
+        }
+    }
+    delete wrapper;
+}
+
+static void server_finalizer(void* ptr) {
+    delete static_cast<ServerWrapper*>(ptr);
+}
+
+static void noop_foreach(void*, b_lean_obj_arg) {}
+
+// ============================================================================
+// Initialization
+// ============================================================================
+
+static void init_external_classes() {
+    if (g_channel_class == nullptr) {
+        g_channel_class = lean_register_external_class(channel_finalizer, noop_foreach);
+        g_client_stream_class = lean_register_external_class(client_stream_finalizer, noop_foreach);
+        g_server_stream_class = lean_register_external_class(server_stream_finalizer, noop_foreach);
+        g_bidi_stream_class = lean_register_external_class(bidi_stream_finalizer, noop_foreach);
+        g_server_builder_class = lean_register_external_class(server_builder_finalizer, noop_foreach);
+        g_server_class = lean_register_external_class(server_finalizer, noop_foreach);
+    }
+}
+
+extern "C" LEAN_EXPORT lean_obj_res legate_init(lean_obj_arg /* world */) {
+    std::lock_guard<std::mutex> lock(g_init_mutex);
+    if (!g_initialized.load()) {
+        init_external_classes();
+        g_initialized.store(true);
+    }
+    return lean_io_result_mk_ok(lean_box(0));
+}
+
+extern "C" LEAN_EXPORT lean_obj_res legate_shutdown(lean_obj_arg /* world */) {
+    // gRPC doesn't require explicit shutdown in most cases
+    return lean_io_result_mk_ok(lean_box(0));
+}
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+// Convert Lean String to std::string
+static std::string lean_string_to_std(b_lean_obj_arg s) {
+    return std::string(lean_string_cstr(s), lean_string_size(s) - 1);
+}
+
+// Convert Lean ByteArray to gRPC ByteBuffer
+static grpc::ByteBuffer lean_bytearray_to_bytebuffer(b_lean_obj_arg arr) {
+    size_t size = lean_sarray_size(arr);
+    uint8_t* data = lean_sarray_cptr(arr);
+    grpc::Slice slice(data, size);
+    return grpc::ByteBuffer(&slice, 1);
+}
+
+// Convert gRPC ByteBuffer to Lean ByteArray
+static lean_object* bytebuffer_to_lean_bytearray(const grpc::ByteBuffer& buf) {
+    std::vector<grpc::Slice> slices;
+    buf.Dump(&slices);
+
+    size_t total_size = 0;
+    for (const auto& slice : slices) {
+        total_size += slice.size();
+    }
+
+    lean_object* arr = lean_alloc_sarray(1, total_size, total_size);
+    uint8_t* ptr = lean_sarray_cptr(arr);
+
+    for (const auto& slice : slices) {
+        memcpy(ptr, slice.begin(), slice.size());
+        ptr += slice.size();
+    }
+
+    return arr;
+}
+
+// Create a Lean IO result (ok)
+static lean_object* mk_io_result_ok(lean_object* val) {
+    return lean_io_result_mk_ok(val);
+}
+
+// Create a Lean IO error
+static lean_object* mk_io_error(const std::string& msg) {
+    return lean_io_result_mk_error(lean_mk_io_user_error(lean_mk_string(msg.c_str())));
+}
+
+// Create a Lean pair (α × β)
+static lean_object* mk_pair(lean_object* fst, lean_object* snd) {
+    lean_object* pair = lean_alloc_ctor(0, 2, 0);
+    lean_ctor_set(pair, 0, fst);
+    lean_ctor_set(pair, 1, snd);
+    return pair;
+}
+
+// Create Except.ok
+static lean_object* mk_except_ok(lean_object* val) {
+    lean_object* result = lean_alloc_ctor(1, 1, 0);  // Except.ok constructor
+    lean_ctor_set(result, 0, val);
+    return result;
+}
+
+// Create Except.error with GrpcError
+// GrpcError : StatusCode × String × Option ByteArray
+static lean_object* mk_except_error(const grpc::Status& status) {
+    // StatusCode is a simple enum (UInt8-like after boxing)
+    lean_object* code = lean_box(static_cast<unsigned>(status.error_code()));
+
+    // Error message
+    lean_object* msg = lean_mk_string(status.error_message().c_str());
+
+    // Details (Option ByteArray) - for now, always none
+    lean_object* details = lean_box(0);  // Option.none
+
+    // Create GrpcError structure
+    lean_object* grpc_error = lean_alloc_ctor(0, 3, 0);
+    lean_ctor_set(grpc_error, 0, code);
+    lean_ctor_set(grpc_error, 1, msg);
+    lean_ctor_set(grpc_error, 2, details);
+
+    // Wrap in Except.error
+    lean_object* result = lean_alloc_ctor(0, 1, 0);  // Except.error constructor
+    lean_ctor_set(result, 0, grpc_error);
+    return result;
+}
+
+// Create Lean Option.some
+static lean_object* mk_option_some(lean_object* val) {
+    lean_object* opt = lean_alloc_ctor(1, 1, 0);  // Option.some
+    lean_ctor_set(opt, 0, val);
+    return opt;
+}
+
+// Create Lean Option.none
+static lean_object* mk_option_none() {
+    return lean_box(0);  // Option.none
+}
+
+// Convert Lean metadata array to gRPC metadata
+static void apply_metadata(grpc::ClientContext* ctx, b_lean_obj_arg metadata) {
+    size_t len = lean_array_size(metadata);
+    for (size_t i = 0; i < len; i++) {
+        lean_object* pair = lean_array_get_core(metadata, i);
+        lean_object* key = lean_ctor_get(pair, 0);
+        lean_object* val = lean_ctor_get(pair, 1);
+        ctx->AddMetadata(lean_string_to_std(key), lean_string_to_std(val));
+    }
+}
+
+// Convert gRPC trailing metadata to Lean array
+static lean_object* trailing_metadata_to_lean(
+    const std::multimap<grpc::string_ref, grpc::string_ref>& metadata
+) {
+    lean_object* arr = lean_mk_empty_array();
+    for (const auto& [key, val] : metadata) {
+        lean_object* k = lean_mk_string_from_bytes(key.data(), key.size());
+        lean_object* v = lean_mk_string_from_bytes(val.data(), val.size());
+        lean_object* pair = mk_pair(k, v);
+        arr = lean_array_push(arr, pair);
+    }
+    return arr;
+}
+
+// Apply timeout to context
+static void apply_timeout(grpc::ClientContext* ctx, uint64_t timeout_ms) {
+    if (timeout_ms > 0) {
+        ctx->set_deadline(std::chrono::system_clock::now() +
+                         std::chrono::milliseconds(timeout_ms));
+    }
+}
+
+// Create Lean Status structure
+static lean_object* mk_status(const grpc::Status& status) {
+    lean_object* code = lean_box(static_cast<unsigned>(status.error_code()));
+    lean_object* msg = lean_mk_string(status.error_message().c_str());
+    lean_object* s = lean_alloc_ctor(0, 2, 0);
+    lean_ctor_set(s, 0, code);
+    lean_ctor_set(s, 1, msg);
+    return s;
+}
+
+// ============================================================================
+// Channel Operations
+// ============================================================================
+
+extern "C" LEAN_EXPORT lean_obj_res legate_channel_create_insecure(
+    b_lean_obj_arg target,
+    lean_obj_arg /* world */
+) {
+    if (!g_initialized.load()) {
+        legate_init(lean_box(0));
+    }
+
+    std::string target_str = lean_string_to_std(target);
+    auto channel = grpc::CreateChannel(target_str, grpc::InsecureChannelCredentials());
+
+    auto* wrapper = new ChannelWrapper(channel);
+    lean_object* obj = lean_alloc_external(g_channel_class, wrapper);
+    return mk_io_result_ok(obj);
+}
+
+extern "C" LEAN_EXPORT lean_obj_res legate_channel_create_secure(
+    b_lean_obj_arg target,
+    b_lean_obj_arg root_certs,
+    b_lean_obj_arg private_key,
+    b_lean_obj_arg cert_chain,
+    lean_obj_arg /* world */
+) {
+    if (!g_initialized.load()) {
+        legate_init(lean_box(0));
+    }
+
+    std::string target_str = lean_string_to_std(target);
+    std::string root_certs_str = lean_string_to_std(root_certs);
+    std::string private_key_str = lean_string_to_std(private_key);
+    std::string cert_chain_str = lean_string_to_std(cert_chain);
+
+    grpc::SslCredentialsOptions opts;
+    if (!root_certs_str.empty()) {
+        opts.pem_root_certs = root_certs_str;
+    }
+    if (!private_key_str.empty()) {
+        opts.pem_private_key = private_key_str;
+    }
+    if (!cert_chain_str.empty()) {
+        opts.pem_cert_chain = cert_chain_str;
+    }
+
+    auto creds = grpc::SslCredentials(opts);
+    auto channel = grpc::CreateChannel(target_str, creds);
+
+    auto* wrapper = new ChannelWrapper(channel);
+    lean_object* obj = lean_alloc_external(g_channel_class, wrapper);
+    return mk_io_result_ok(obj);
+}
+
+extern "C" LEAN_EXPORT lean_obj_res legate_channel_get_state(
+    b_lean_obj_arg channel,
+    uint8_t try_connect,
+    lean_obj_arg /* world */
+) {
+    auto* wrapper = static_cast<ChannelWrapper*>(lean_get_external_data(channel));
+    grpc_connectivity_state state = wrapper->channel->GetState(try_connect != 0);
+    return mk_io_result_ok(lean_box(static_cast<unsigned>(state)));
+}
+
+// ============================================================================
+// Unary Call
+// ============================================================================
+
+extern "C" LEAN_EXPORT lean_obj_res legate_unary_call(
+    b_lean_obj_arg channel,
+    b_lean_obj_arg method,
+    b_lean_obj_arg request,
+    uint64_t timeout_ms,
+    b_lean_obj_arg metadata,
+    lean_obj_arg /* world */
+) {
+    auto* wrapper = static_cast<ChannelWrapper*>(lean_get_external_data(channel));
+    std::string method_str = lean_string_to_std(method);
+
+    grpc::ClientContext context;
+    apply_timeout(&context, timeout_ms);
+    apply_metadata(&context, metadata);
+
+    grpc::ByteBuffer request_buf = lean_bytearray_to_bytebuffer(request);
+    grpc::ByteBuffer response_buf;
+
+    // Synchronous unary call using the generic stub
+    grpc::Status status = wrapper->stub->UnaryCall(
+        &context, method_str, grpc::StubOptions(), &request_buf, &response_buf);
+
+    if (status.ok()) {
+        lean_object* response = bytebuffer_to_lean_bytearray(response_buf);
+        lean_object* trailers = trailing_metadata_to_lean(context.GetServerTrailingMetadata());
+        lean_object* pair = mk_pair(response, trailers);
+        return mk_io_result_ok(mk_except_ok(pair));
+    } else {
+        return mk_io_result_ok(mk_except_error(status));
+    }
+}
+
+// ============================================================================
+// Client Streaming Call
+// ============================================================================
+
+extern "C" LEAN_EXPORT lean_obj_res legate_client_streaming_call_start(
+    b_lean_obj_arg channel,
+    b_lean_obj_arg method,
+    uint64_t timeout_ms,
+    b_lean_obj_arg metadata,
+    lean_obj_arg /* world */
+) {
+    auto* ch_wrapper = static_cast<ChannelWrapper*>(lean_get_external_data(channel));
+    std::string method_str = lean_string_to_std(method);
+
+    auto* wrapper = new ClientStreamWrapper();
+    apply_timeout(wrapper->context.get(), timeout_ms);
+    apply_metadata(wrapper->context.get(), metadata);
+
+    // Start the async call
+    wrapper->writer = ch_wrapper->stub->PrepareUnaryCall(
+        wrapper->context.get(), method_str, &wrapper->response, &wrapper->cq);
+
+    wrapper->writer->StartCall(reinterpret_cast<void*>(1));
+
+    // Wait for start
+    void* tag;
+    bool ok;
+    wrapper->cq.Next(&tag, &ok);
+    if (!ok) {
+        delete wrapper;
+        grpc::Status failed(grpc::StatusCode::INTERNAL, "Failed to start client streaming call");
+        return mk_io_result_ok(mk_except_error(failed));
+    }
+
+    lean_object* obj = lean_alloc_external(g_client_stream_class, wrapper);
+    return mk_io_result_ok(mk_except_ok(obj));
+}
+
+extern "C" LEAN_EXPORT lean_obj_res legate_client_stream_write(
+    b_lean_obj_arg stream,
+    b_lean_obj_arg data,
+    lean_obj_arg /* world */
+) {
+    auto* wrapper = static_cast<ClientStreamWrapper*>(lean_get_external_data(stream));
+
+    if (wrapper->writes_done) {
+        grpc::Status err(grpc::StatusCode::FAILED_PRECONDITION, "Stream writes already done");
+        return mk_io_result_ok(mk_except_error(err));
+    }
+
+    grpc::ByteBuffer buf = lean_bytearray_to_bytebuffer(data);
+    wrapper->writer->Write(buf, reinterpret_cast<void*>(2));
+
+    void* tag;
+    bool ok;
+    wrapper->cq.Next(&tag, &ok);
+    if (!ok) {
+        grpc::Status err(grpc::StatusCode::INTERNAL, "Write failed");
+        return mk_io_result_ok(mk_except_error(err));
+    }
+
+    return mk_io_result_ok(mk_except_ok(lean_box(0)));
+}
+
+extern "C" LEAN_EXPORT lean_obj_res legate_client_stream_writes_done(
+    b_lean_obj_arg stream,
+    lean_obj_arg /* world */
+) {
+    auto* wrapper = static_cast<ClientStreamWrapper*>(lean_get_external_data(stream));
+
+    if (wrapper->writes_done) {
+        return mk_io_result_ok(mk_except_ok(lean_box(0)));
+    }
+
+    wrapper->writer->WritesDone(reinterpret_cast<void*>(3));
+    wrapper->writes_done = true;
+
+    void* tag;
+    bool ok;
+    wrapper->cq.Next(&tag, &ok);
+    // WritesDone might return !ok but that's often fine
+
+    return mk_io_result_ok(mk_except_ok(lean_box(0)));
+}
+
+extern "C" LEAN_EXPORT lean_obj_res legate_client_stream_finish(
+    b_lean_obj_arg stream,
+    lean_obj_arg /* world */
+) {
+    auto* wrapper = static_cast<ClientStreamWrapper*>(lean_get_external_data(stream));
+
+    if (!wrapper->writes_done) {
+        legate_client_stream_writes_done(stream, lean_box(0));
+    }
+
+    wrapper->writer->Finish(&wrapper->status, reinterpret_cast<void*>(4));
+
+    void* tag;
+    bool ok;
+    wrapper->cq.Next(&tag, &ok);
+
+    if (wrapper->status.ok()) {
+        lean_object* response = bytebuffer_to_lean_bytearray(wrapper->response);
+        lean_object* trailers = trailing_metadata_to_lean(
+            wrapper->context->GetServerTrailingMetadata());
+        lean_object* status = mk_status(wrapper->status);
+        lean_object* result = lean_alloc_ctor(0, 3, 0);
+        lean_ctor_set(result, 0, response);
+        lean_ctor_set(result, 1, trailers);
+        lean_ctor_set(result, 2, status);
+        return mk_io_result_ok(mk_except_ok(result));
+    } else {
+        return mk_io_result_ok(mk_except_error(wrapper->status));
+    }
+}
+
+// ============================================================================
+// Server Streaming Call
+// ============================================================================
+
+extern "C" LEAN_EXPORT lean_obj_res legate_server_streaming_call_start(
+    b_lean_obj_arg channel,
+    b_lean_obj_arg method,
+    b_lean_obj_arg request,
+    uint64_t timeout_ms,
+    b_lean_obj_arg metadata,
+    lean_obj_arg /* world */
+) {
+    auto* ch_wrapper = static_cast<ChannelWrapper*>(lean_get_external_data(channel));
+    std::string method_str = lean_string_to_std(method);
+
+    auto* wrapper = new ServerStreamWrapper();
+    apply_timeout(wrapper->context.get(), timeout_ms);
+    apply_metadata(wrapper->context.get(), metadata);
+
+    grpc::ByteBuffer request_buf = lean_bytearray_to_bytebuffer(request);
+
+    wrapper->reader = ch_wrapper->stub->PrepareCall(
+        wrapper->context.get(), method_str, &wrapper->cq);
+
+    // Note: For server streaming, we need to use the Call interface differently
+    // This is a simplified implementation
+    wrapper->reader->StartCall(reinterpret_cast<void*>(1));
+
+    void* tag;
+    bool ok;
+    wrapper->cq.Next(&tag, &ok);
+    if (!ok) {
+        delete wrapper;
+        grpc::Status failed(grpc::StatusCode::INTERNAL, "Failed to start server streaming call");
+        return mk_io_result_ok(mk_except_error(failed));
+    }
+
+    lean_object* obj = lean_alloc_external(g_server_stream_class, wrapper);
+    return mk_io_result_ok(mk_except_ok(obj));
+}
+
+extern "C" LEAN_EXPORT lean_obj_res legate_server_stream_read(
+    b_lean_obj_arg stream,
+    lean_obj_arg /* world */
+) {
+    auto* wrapper = static_cast<ServerStreamWrapper*>(lean_get_external_data(stream));
+
+    if (wrapper->finished) {
+        return mk_io_result_ok(mk_except_ok(mk_option_none()));
+    }
+
+    grpc::ByteBuffer response;
+    wrapper->reader->Read(&response, reinterpret_cast<void*>(2));
+
+    void* tag;
+    bool ok;
+    wrapper->cq.Next(&tag, &ok);
+
+    if (!ok) {
+        // Stream ended
+        wrapper->finished = true;
+        return mk_io_result_ok(mk_except_ok(mk_option_none()));
+    }
+
+    lean_object* data = bytebuffer_to_lean_bytearray(response);
+    return mk_io_result_ok(mk_except_ok(mk_option_some(data)));
+}
+
+extern "C" LEAN_EXPORT lean_obj_res legate_server_stream_get_trailers(
+    b_lean_obj_arg stream,
+    lean_obj_arg /* world */
+) {
+    auto* wrapper = static_cast<ServerStreamWrapper*>(lean_get_external_data(stream));
+    lean_object* trailers = trailing_metadata_to_lean(
+        wrapper->context->GetServerTrailingMetadata());
+    return mk_io_result_ok(trailers);
+}
+
+extern "C" LEAN_EXPORT lean_obj_res legate_server_stream_get_status(
+    b_lean_obj_arg stream,
+    lean_obj_arg /* world */
+) {
+    auto* wrapper = static_cast<ServerStreamWrapper*>(lean_get_external_data(stream));
+
+    if (!wrapper->finished) {
+        // Need to finish first
+        wrapper->reader->Finish(&wrapper->status, reinterpret_cast<void*>(3));
+        void* tag;
+        bool ok;
+        wrapper->cq.Next(&tag, &ok);
+        wrapper->finished = true;
+    }
+
+    return mk_io_result_ok(mk_status(wrapper->status));
+}
+
+// ============================================================================
+// Bidirectional Streaming Call
+// ============================================================================
+
+extern "C" LEAN_EXPORT lean_obj_res legate_bidi_streaming_call_start(
+    b_lean_obj_arg channel,
+    b_lean_obj_arg method,
+    uint64_t timeout_ms,
+    b_lean_obj_arg metadata,
+    lean_obj_arg /* world */
+) {
+    auto* ch_wrapper = static_cast<ChannelWrapper*>(lean_get_external_data(channel));
+    std::string method_str = lean_string_to_std(method);
+
+    auto* wrapper = new BidiStreamWrapper();
+    apply_timeout(wrapper->context.get(), timeout_ms);
+    apply_metadata(wrapper->context.get(), metadata);
+
+    wrapper->stream = ch_wrapper->stub->PrepareCall(
+        wrapper->context.get(), method_str, &wrapper->cq);
+
+    wrapper->stream->StartCall(reinterpret_cast<void*>(1));
+
+    void* tag;
+    bool ok;
+    wrapper->cq.Next(&tag, &ok);
+    if (!ok) {
+        delete wrapper;
+        grpc::Status failed(grpc::StatusCode::INTERNAL, "Failed to start bidi streaming call");
+        return mk_io_result_ok(mk_except_error(failed));
+    }
+
+    lean_object* obj = lean_alloc_external(g_bidi_stream_class, wrapper);
+    return mk_io_result_ok(mk_except_ok(obj));
+}
+
+extern "C" LEAN_EXPORT lean_obj_res legate_bidi_stream_write(
+    b_lean_obj_arg stream,
+    b_lean_obj_arg data,
+    lean_obj_arg /* world */
+) {
+    auto* wrapper = static_cast<BidiStreamWrapper*>(lean_get_external_data(stream));
+
+    if (wrapper->writes_done) {
+        grpc::Status err(grpc::StatusCode::FAILED_PRECONDITION, "Stream writes already done");
+        return mk_io_result_ok(mk_except_error(err));
+    }
+
+    grpc::ByteBuffer buf = lean_bytearray_to_bytebuffer(data);
+    wrapper->stream->Write(buf, reinterpret_cast<void*>(2));
+
+    void* tag;
+    bool ok;
+    wrapper->cq.Next(&tag, &ok);
+    if (!ok) {
+        grpc::Status err(grpc::StatusCode::INTERNAL, "Write failed");
+        return mk_io_result_ok(mk_except_error(err));
+    }
+
+    return mk_io_result_ok(mk_except_ok(lean_box(0)));
+}
+
+extern "C" LEAN_EXPORT lean_obj_res legate_bidi_stream_writes_done(
+    b_lean_obj_arg stream,
+    lean_obj_arg /* world */
+) {
+    auto* wrapper = static_cast<BidiStreamWrapper*>(lean_get_external_data(stream));
+
+    if (wrapper->writes_done) {
+        return mk_io_result_ok(mk_except_ok(lean_box(0)));
+    }
+
+    wrapper->stream->WritesDone(reinterpret_cast<void*>(3));
+    wrapper->writes_done = true;
+
+    void* tag;
+    bool ok;
+    wrapper->cq.Next(&tag, &ok);
+
+    return mk_io_result_ok(mk_except_ok(lean_box(0)));
+}
+
+extern "C" LEAN_EXPORT lean_obj_res legate_bidi_stream_read(
+    b_lean_obj_arg stream,
+    lean_obj_arg /* world */
+) {
+    auto* wrapper = static_cast<BidiStreamWrapper*>(lean_get_external_data(stream));
+
+    if (wrapper->read_finished) {
+        return mk_io_result_ok(mk_except_ok(mk_option_none()));
+    }
+
+    grpc::ByteBuffer response;
+    wrapper->stream->Read(&response, reinterpret_cast<void*>(4));
+
+    void* tag;
+    bool ok;
+    wrapper->cq.Next(&tag, &ok);
+
+    if (!ok) {
+        wrapper->read_finished = true;
+        return mk_io_result_ok(mk_except_ok(mk_option_none()));
+    }
+
+    lean_object* data = bytebuffer_to_lean_bytearray(response);
+    return mk_io_result_ok(mk_except_ok(mk_option_some(data)));
+}
+
+extern "C" LEAN_EXPORT lean_obj_res legate_bidi_stream_get_status(
+    b_lean_obj_arg stream,
+    lean_obj_arg /* world */
+) {
+    auto* wrapper = static_cast<BidiStreamWrapper*>(lean_get_external_data(stream));
+
+    if (!wrapper->writes_done) {
+        legate_bidi_stream_writes_done(stream, lean_box(0));
+    }
+
+    wrapper->stream->Finish(&wrapper->status, reinterpret_cast<void*>(5));
+    void* tag;
+    bool ok;
+    wrapper->cq.Next(&tag, &ok);
+
+    return mk_io_result_ok(mk_status(wrapper->status));
+}
+
+// ============================================================================
+// Server Operations
+// ============================================================================
+
+extern "C" LEAN_EXPORT lean_obj_res legate_server_builder_new(lean_obj_arg /* world */) {
+    if (!g_initialized.load()) {
+        legate_init(lean_box(0));
+    }
+
+    auto* wrapper = new ServerBuilderWrapper();
+    lean_object* obj = lean_alloc_external(g_server_builder_class, wrapper);
+    return mk_io_result_ok(obj);
+}
+
+extern "C" LEAN_EXPORT lean_obj_res legate_server_builder_add_listening_port(
+    b_lean_obj_arg builder,
+    b_lean_obj_arg addr,
+    uint8_t use_tls,
+    lean_obj_arg /* world */
+) {
+    auto* wrapper = static_cast<ServerBuilderWrapper*>(lean_get_external_data(builder));
+    std::string addr_str = lean_string_to_std(addr);
+
+    if (use_tls) {
+        // For TLS, would need to pass credentials - simplified for now
+        wrapper->builder->AddListeningPort(
+            addr_str,
+            grpc::InsecureServerCredentials(),  // TODO: proper TLS support
+            &wrapper->selected_port);
+    } else {
+        wrapper->builder->AddListeningPort(
+            addr_str, grpc::InsecureServerCredentials(), &wrapper->selected_port);
+    }
+
+    return mk_io_result_ok(lean_box(static_cast<unsigned>(wrapper->selected_port)));
+}
+
+extern "C" LEAN_EXPORT lean_obj_res legate_server_builder_register_handler(
+    b_lean_obj_arg builder,
+    b_lean_obj_arg method,
+    uint8_t handler_type,
+    lean_obj_arg handler,
+    lean_obj_arg /* world */
+) {
+    auto* wrapper = static_cast<ServerBuilderWrapper*>(lean_get_external_data(builder));
+
+    RegisteredHandler h;
+    h.method = lean_string_to_std(method);
+    h.handler_type = handler_type;
+    h.handler = handler;
+    lean_inc(handler);  // Keep handler alive
+
+    wrapper->handlers.push_back(std::move(h));
+    return mk_io_result_ok(lean_box(0));
+}
+
+extern "C" LEAN_EXPORT lean_obj_res legate_server_builder_build(
+    b_lean_obj_arg builder,
+    lean_obj_arg /* world */
+) {
+    auto* b_wrapper = static_cast<ServerBuilderWrapper*>(lean_get_external_data(builder));
+
+    auto* s_wrapper = new ServerWrapper();
+
+    // Add completion queue
+    s_wrapper->cq = b_wrapper->builder->AddCompletionQueue();
+
+    // Build the server
+    s_wrapper->server = b_wrapper->builder->BuildAndStart();
+    if (!s_wrapper->server) {
+        delete s_wrapper;
+        return mk_io_error("Failed to build server");
+    }
+
+    // Move handlers
+    s_wrapper->handlers = std::move(b_wrapper->handlers);
+    b_wrapper->handlers.clear();
+
+    lean_object* obj = lean_alloc_external(g_server_class, s_wrapper);
+    return mk_io_result_ok(obj);
+}
+
+extern "C" LEAN_EXPORT lean_obj_res legate_server_start(
+    b_lean_obj_arg server,
+    lean_obj_arg /* world */
+) {
+    auto* wrapper = static_cast<ServerWrapper*>(lean_get_external_data(server));
+
+    if (wrapper->running.load()) {
+        return mk_io_result_ok(lean_box(0));
+    }
+
+    wrapper->running.store(true);
+
+    // Start the polling thread for handling requests
+    wrapper->polling_thread = std::thread([wrapper]() {
+        // Simplified polling loop - actual implementation would dispatch to Lean handlers
+        while (wrapper->running.load()) {
+            void* tag;
+            bool ok;
+            auto deadline = std::chrono::system_clock::now() + std::chrono::milliseconds(100);
+            auto status = wrapper->cq->AsyncNext(&tag, &ok, deadline);
+            if (status == grpc::CompletionQueue::SHUTDOWN) {
+                break;
+            }
+            if (status == grpc::CompletionQueue::GOT_EVENT && ok) {
+                // TODO: dispatch to appropriate handler based on tag
+            }
+        }
+    });
+
+    return mk_io_result_ok(lean_box(0));
+}
+
+extern "C" LEAN_EXPORT lean_obj_res legate_server_wait(
+    b_lean_obj_arg server,
+    lean_obj_arg /* world */
+) {
+    auto* wrapper = static_cast<ServerWrapper*>(lean_get_external_data(server));
+    if (wrapper->server) {
+        wrapper->server->Wait();
+    }
+    return mk_io_result_ok(lean_box(0));
+}
+
+extern "C" LEAN_EXPORT lean_obj_res legate_server_shutdown(
+    b_lean_obj_arg server,
+    lean_obj_arg /* world */
+) {
+    auto* wrapper = static_cast<ServerWrapper*>(lean_get_external_data(server));
+
+    wrapper->running.store(false);
+
+    if (wrapper->server) {
+        wrapper->server->Shutdown();
+    }
+    if (wrapper->cq) {
+        wrapper->cq->Shutdown();
+    }
+    if (wrapper->polling_thread.joinable()) {
+        wrapper->polling_thread.join();
+    }
+
+    return mk_io_result_ok(lean_box(0));
+}
+
+extern "C" LEAN_EXPORT lean_obj_res legate_server_shutdown_now(
+    b_lean_obj_arg server,
+    lean_obj_arg /* world */
+) {
+    // Same as shutdown for now
+    return legate_server_shutdown(server, lean_box(0));
+}

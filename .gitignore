@@ -1,0 +1,18 @@
+# Lake build directory
+/.lake
+
+# Build artifacts
+/build
+
+# Editor files
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# macOS
+.DS_Store
+
+# CMake build directories (if building outside of Lake)
+/ffi/build/
