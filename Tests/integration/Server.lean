@@ -35,9 +35,15 @@ def maybeWaitForCancel (ctx : ServerContext) : IO Bool := do
       IO.sleep 10
     return true
 
+/-- Echo headers: echo the x-legate-test header back as initial metadata -/
+def testHeaders (ctx : ServerContext) : Metadata :=
+  match ctx.metadata.get? "x-legate-test" with
+  | some v => #[("x-legate-response-header", v)]
+  | none => #[]
+
 /-- Echo handler: returns "ECHO:" + request data -/
 def handleEcho (ctx : ServerContext) (requestBytes : ByteArray)
-    : IO (GrpcResult (ByteArray × Metadata)) := do
+    : IO (GrpcResult (ByteArray × Metadata × Metadata)) := do
   if (← maybeWaitForCancel ctx) then
     return .error (GrpcError.mk .cancelled "Cancelled" none)
 
@@ -47,15 +53,16 @@ def handleEcho (ctx : ServerContext) (requestBytes : ByteArray)
   | .ok request =>
     let responseData := "ECHO:".toUTF8 ++ request.data
     let response : EchoResponse := { data := responseData }
-    return .ok (Protolean.encodeMessage response, testTrailers ctx)
+    -- Return (response, headers, trailers)
+    return .ok (Protolean.encodeMessage response, testHeaders ctx, testTrailers ctx)
   | .error e =>
     return .error (GrpcError.mk .invalidArgument s!"Decode error: {e}" none)
 
 /-- Collect handler: joins all messages with "|"
     Note: Streaming handlers are not yet fully implemented in the FFI.
 -/
-def handleCollect (_ctx : ServerContext) (recv : IO (Option ByteArray))
-    : IO (GrpcResult (ByteArray × Metadata)) := do
+def handleCollect (ctx : ServerContext) (recv : IO (Option ByteArray))
+    : IO (GrpcResult (ByteArray × Metadata × Metadata)) := do
   -- Read all messages using a loop
   let mut parts : Array ByteArray := #[]
   let mut count : Int32 := 0
@@ -76,28 +83,30 @@ def handleCollect (_ctx : ServerContext) (recv : IO (Option ByteArray))
     else acc ++ "|".toUTF8 ++ part
 
   let response : CollectResponse := { data := joined, count := count }
-  return .ok (Protolean.encodeMessage response, testTrailers _ctx)
+  -- Return (response, headers, trailers)
+  return .ok (Protolean.encodeMessage response, testHeaders ctx, testTrailers ctx)
 
 /-- Expand handler: sends N numbered responses
     Note: Streaming handlers are not yet fully implemented in the FFI.
 -/
-def handleExpand (_ctx : ServerContext) (requestBytes : ByteArray) (send : ByteArray → IO Unit)
-    : IO (GrpcResult Metadata) := do
+def handleExpand (ctx : ServerContext) (requestBytes : ByteArray) (send : ByteArray → IO Unit)
+    : IO (GrpcResult (Metadata × Metadata)) := do
   match Protolean.decodeMessage (α := ExpandRequest) requestBytes with
   | .ok request =>
     for i in [:request.count.toInt.toNat] do
       let data := s!"{String.fromUTF8! request.prefix_}:{i}".toUTF8
       let response : ExpandResponse := { data := data, sequence := i.toInt32 }
       send (Protolean.encodeMessage response)
-    return .ok (testTrailers _ctx)
+    -- Return (headers, trailers)
+    return .ok (testHeaders ctx, testTrailers ctx)
   | .error e =>
     return .error (GrpcError.mk .invalidArgument s!"Decode error: {e}" none)
 
 /-- BiEcho handler: echoes each message with sequence number
     Note: Streaming handlers are not yet fully implemented in the FFI.
 -/
-def handleBiEcho (_ctx : ServerContext) (recv : IO (Option ByteArray)) (send : ByteArray → IO Unit)
-    : IO (GrpcResult Metadata) := do
+def handleBiEcho (ctx : ServerContext) (recv : IO (Option ByteArray)) (send : ByteArray → IO Unit)
+    : IO (GrpcResult (Metadata × Metadata)) := do
   let mut seq : Int32 := 0
   let mut done := false
   while !done do
@@ -112,7 +121,8 @@ def handleBiEcho (_ctx : ServerContext) (recv : IO (Option ByteArray)) (send : B
       | .error _ => pure ()  -- Skip malformed
     | none => done := true
 
-  return .ok (testTrailers _ctx)
+  -- Return (headers, trailers)
+  return .ok (testHeaders ctx, testTrailers ctx)
 
 /-- Start the Lean TestService server -/
 def runTestServer (port : Nat := 50051) : IO Unit := do

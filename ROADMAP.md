@@ -6,11 +6,13 @@ The roadmap below is organized around “common gRPC features” and the **tests
 
 ## Current Status (as of 2025-12-17)
 
-What’s working and covered by tests today:
+What's working and covered by tests today:
 
 - **RPC shapes:** unary, client-streaming, server-streaming, bidi-streaming
 - **Protobuf:** request/response message roundtrips via `Protolean`
-- **Trailing metadata (trailers):** request metadata in; trailers out; asserted in tests for all RPC shapes
+- **Metadata:** Full support for request headers, response headers (initial metadata), and trailers for all RPC shapes
+  - Lean client: access response headers via `response.headers` (unary) or `stream.getHeaders()` (streaming)
+  - Lean server: return `(response, headers, trailers)` from handlers
 - **Deadlines + cancellation:** unary deadline-exceeded and unary cancel propagation, exercised cross-language
 - **Lean server call context:** server handlers can query cancellation and deadline remaining time
 - **Test harness:** `./run-tests.sh` builds native FFI and runs unit + integration suites
@@ -21,7 +23,7 @@ The items below are the most important missing pieces for “typical” gRPC usa
 
 ### Metadata
 
-- **Response headers (initial metadata):** not exposed/validated (only trailers are tested)
+- ~~**Response headers (initial metadata):** not exposed/validated (only trailers are tested)~~ ✅ **DONE** - Headers exposed and tested
 - **Multi-value metadata keys:** not tested (multiple values for same key)
 - **Binary metadata (`*-bin`):** not supported/tested
 - **Reserved/transport headers:** behavior not tested (`grpc-timeout`, `content-type`, etc.)
@@ -75,19 +77,23 @@ The items below are the most important missing pieces for “typical” gRPC usa
 
 This is the suggested order to reach “common gRPC feature parity” for Lean.
 
-### Phase 1 — Metadata Parity (Headers + Edge Cases)
+### Phase 1 — Metadata Parity (Headers + Edge Cases) ✅ **COMPLETE**
 
-**Add APIs**
-- Lean client: access **response headers** (initial metadata) for all RPC shapes
-- Lean server: ability to **send initial metadata** explicitly (when needed)
-- Optional: typed helpers for multi-value metadata and `*-bin`
+**Add APIs** ✅
+- ✅ Lean client: access **response headers** (initial metadata) for all RPC shapes
+  - `UnaryResponse.headers` for unary calls
+  - `stream.getHeaders()` for streaming calls (ServerStreamReader, BidiStream, ClientStreamWriter)
+- ✅ Lean server: ability to **send initial metadata** explicitly (when needed)
+  - Handler return types now include headers: `(response, headers, trailers)` for unary/client-streaming
+  - `(headers, trailers)` for server-streaming/bidi-streaming
+- Optional: typed helpers for multi-value metadata and `*-bin` (deferred to later)
 
-**Add tests**
-- Unary + streaming: client asserts both **headers and trailers**
-- Multi-value metadata key roundtrip
-- `*-bin` metadata roundtrip (base64 test vectors; enforce correct casing/validation)
+**Add tests** ✅
+- ✅ Unary + streaming: client asserts both **headers and trailers**
+- Multi-value metadata key roundtrip (deferred)
+- `*-bin` metadata roundtrip (deferred)
 
-**Definition of done**
+**Definition of done** ✅
 - Lean client and Lean server can roundtrip metadata in/out, including headers, across all RPC shapes.
 
 ### Phase 2 — Deadlines & Cancellation for Streaming

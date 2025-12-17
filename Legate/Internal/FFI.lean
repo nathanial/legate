@@ -91,7 +91,9 @@ opaque channelGetState (channel : @& Channel) (tryToConnect : UInt8) : IO UInt32
 -- Unary Call FFI
 -- ============================================================================
 
-/-- Make a unary RPC call -/
+/-- Make a unary RPC call
+    Returns: (data, headers, trailers)
+-/
 @[extern "legate_unary_call"]
 opaque unaryCall
     (channel : @& Channel)
@@ -99,7 +101,7 @@ opaque unaryCall
     (request : @& ByteArray)
     (timeoutMs : UInt64)
     (metadata : @& Metadata)
-    : IO (Except GrpcError (ByteArray × Metadata))
+    : IO (Except GrpcError (ByteArray × Metadata × Metadata))
 
 -- ============================================================================
 -- Client Streaming FFI
@@ -131,6 +133,10 @@ opaque clientStreamFinish
     (stream : @& ClientStream)
     : IO (Except GrpcError (ByteArray × Metadata × Status))
 
+/-- Get initial metadata (response headers) -/
+@[extern "legate_client_stream_get_headers"]
+opaque clientStreamGetHeaders (stream : @& ClientStream) : IO Metadata
+
 -- ============================================================================
 -- Server Streaming FFI
 -- ============================================================================
@@ -152,6 +158,10 @@ opaque serverStreamRead (stream : @& ServerStream) : IO (Except GrpcError (Optio
 /-- Get trailing metadata -/
 @[extern "legate_server_stream_get_trailers"]
 opaque serverStreamGetTrailers (stream : @& ServerStream) : IO Metadata
+
+/-- Get initial metadata (response headers) -/
+@[extern "legate_server_stream_get_headers"]
+opaque serverStreamGetHeaders (stream : @& ServerStream) : IO Metadata
 
 /-- Get the final status -/
 @[extern "legate_server_stream_get_status"]
@@ -193,6 +203,10 @@ opaque bidiStreamRead (stream : @& BidiStream) : IO (Except GrpcError (Option By
   @[extern "legate_bidi_stream_get_trailers"]
   opaque bidiStreamGetTrailers (stream : @& BidiStream) : IO Metadata
 
+  /-- Get initial metadata (response headers) -/
+  @[extern "legate_bidi_stream_get_headers"]
+  opaque bidiStreamGetHeaders (stream : @& BidiStream) : IO Metadata
+
 -- ============================================================================
 -- Server FFI
 -- ============================================================================
@@ -211,46 +225,46 @@ opaque serverBuilderAddListeningPort
 
   /-- Register a unary handler.
       Handler receives: method name, client metadata, request bytes
-      Returns: response bytes and trailing metadata, or error
+      Returns: (response bytes, headers, trailers), or error
   -/
   @[extern "legate_server_register_unary"]
   opaque serverRegisterUnary
       (builder : @& ServerBuilder)
       (method : @& String)
-      (handler : ServerCall → String → Metadata → ByteArray → IO (Except GrpcError (ByteArray × Metadata)))
+      (handler : ServerCall → String → Metadata → ByteArray → IO (Except GrpcError (ByteArray × Metadata × Metadata)))
       : IO Unit
 
   /-- Register a client streaming handler.
       Handler receives: method name, client metadata, recv function
-      Returns: response bytes and trailing metadata, or error
+      Returns: (response bytes, headers, trailers), or error
   -/
   @[extern "legate_server_register_client_streaming"]
   opaque serverRegisterClientStreaming
       (builder : @& ServerBuilder)
       (method : @& String)
-      (handler : ServerCall → String → Metadata → IO (Option ByteArray) → IO (Except GrpcError (ByteArray × Metadata)))
+      (handler : ServerCall → String → Metadata → IO (Option ByteArray) → IO (Except GrpcError (ByteArray × Metadata × Metadata)))
       : IO Unit
 
   /-- Register a server streaming handler.
       Handler receives: method name, client metadata, request bytes, send function
-      Returns: trailing metadata, or error
+      Returns: (headers, trailers), or error
   -/
   @[extern "legate_server_register_server_streaming"]
   opaque serverRegisterServerStreaming
       (builder : @& ServerBuilder)
       (method : @& String)
-      (handler : ServerCall → String → Metadata → ByteArray → (ByteArray → IO Unit) → IO (Except GrpcError Metadata))
+      (handler : ServerCall → String → Metadata → ByteArray → (ByteArray → IO Unit) → IO (Except GrpcError (Metadata × Metadata)))
       : IO Unit
 
   /-- Register a bidirectional streaming handler.
       Handler receives: method name, client metadata, recv function, send function
-      Returns: trailing metadata, or error
+      Returns: (headers, trailers), or error
   -/
   @[extern "legate_server_register_bidi_streaming"]
   opaque serverRegisterBidiStreaming
       (builder : @& ServerBuilder)
       (method : @& String)
-      (handler : ServerCall → String → Metadata → IO (Option ByteArray) → (ByteArray → IO Unit) → IO (Except GrpcError Metadata))
+      (handler : ServerCall → String → Metadata → IO (Option ByteArray) → (ByteArray → IO Unit) → IO (Except GrpcError (Metadata × Metadata)))
       : IO Unit
 
   /-- Check whether the client has cancelled this call -/

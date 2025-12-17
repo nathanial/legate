@@ -43,6 +43,36 @@ def testUnaryMetadata : IO TestResult := do
   | .error e =>
     return .failed s!"RPC error: {e}"
 
+/-- Test unary Echo RPC with response headers (initial metadata) -/
+def testUnaryHeaders : IO TestResult := do
+  let channel ← Channel.createInsecure serverAddr
+
+  let request : EchoRequest := { data := "headers-test".toUTF8 }
+  let requestBytes := Protolean.encodeMessage request
+
+  let opts := (CallOptions.default).withMetadata #[("x-legate-test", "header-value")]
+  match ← unaryCall channel echoMethod requestBytes opts with
+  | .ok response =>
+    -- Check response headers (initial metadata)
+    match response.headers.get? "x-legate-response-header" with
+    | some v =>
+      if v == "header-value" then
+        -- Also verify trailers still work
+        match response.trailers.get? "x-legate-test" with
+        | some tv =>
+          if tv == "header-value" then
+            return .passed
+          else
+            return .failed s!"Expected trailer x-legate-test=header-value, got {tv}"
+        | none =>
+          return .failed "Missing trailer x-legate-test"
+      else
+        return .failed s!"Expected header x-legate-response-header=header-value, got {v}"
+    | none =>
+      return .failed "Missing header x-legate-response-header"
+  | .error e =>
+    return .failed s!"RPC error: {e}"
+
 /-- Test unary deadlines -/
 def testUnaryDeadlineExceeded : IO TestResult := do
   let channel ← Channel.createInsecure serverAddr
@@ -217,13 +247,48 @@ def testBidiStreaming : IO TestResult := do
   | .error e =>
     return .failed s!"Start stream error: {e}"
 
+/-- Test server streaming with headers -/
+def testServerStreamingHeaders : IO TestResult := do
+  let channel ← Channel.createInsecure serverAddr
+  let opts := (CallOptions.default).withMetadata #[("x-legate-test", "stream-header")]
+
+  let request : ExpandRequest := { count := 2, prefix_ := "hdr".toUTF8 }
+  let requestBytes := Protolean.encodeMessage request
+
+  match ← serverStreamingCall channel expandMethod requestBytes opts with
+  | .ok stream =>
+    -- Read at least one message to ensure headers are available
+    match ← stream.read with
+    | .ok (some _) =>
+      -- Check response headers
+      let headers ← stream.getHeaders
+      match headers.get? "x-legate-response-header" with
+      | some v =>
+        if v == "stream-header" then
+          -- Drain remaining messages
+          while true do
+            match ← stream.read with
+            | .ok (some _) => continue
+            | _ => break
+          return .passed
+        else
+          return .failed s!"Expected header x-legate-response-header=stream-header, got {v}"
+      | none =>
+        return .failed "Missing header x-legate-response-header"
+    | .ok none => return .failed "No messages received"
+    | .error e => return .failed s!"Read error: {e}"
+  | .error e =>
+    return .failed s!"Start stream error: {e}"
+
 /-- Client test suite -/
 def clientTestSuite : TestSuite := suite "Lean Client -> Go Server" #[
   test "Unary Echo" testUnaryEcho,
   test "Unary Metadata" testUnaryMetadata,
+  test "Unary Headers" testUnaryHeaders,
   test "Unary Deadline" testUnaryDeadlineExceeded,
   test "Client Streaming Collect" testClientStreamingCollect,
   test "Server Streaming Expand" testServerStreamingExpand,
+  test "Server Streaming Headers" testServerStreamingHeaders,
   test "Bidirectional BiEcho" testBidiStreaming
 ]
 

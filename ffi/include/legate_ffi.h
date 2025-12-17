@@ -44,7 +44,7 @@ LEAN_EXPORT lean_obj_res legate_channel_get_state(b_lean_obj_arg channel, uint8_
 // ============================================================================
 
 // Make a unary RPC call
-// Returns: Except GrpcError (ByteArray × Metadata)
+// Returns: Except GrpcError (ByteArray × Metadata × Metadata) = (data, headers, trailers)
 LEAN_EXPORT lean_obj_res legate_unary_call(
     b_lean_obj_arg channel,
     b_lean_obj_arg method,          // Full method name, e.g., "/package.Service/Method"
@@ -82,6 +82,9 @@ LEAN_EXPORT lean_obj_res legate_client_stream_writes_done(b_lean_obj_arg stream,
 // Returns: Except GrpcError (ByteArray × Metadata × Status)
 LEAN_EXPORT lean_obj_res legate_client_stream_finish(b_lean_obj_arg stream, lean_obj_arg world);
 
+// Get initial metadata (response headers) from a client stream
+LEAN_EXPORT lean_obj_res legate_client_stream_get_headers(b_lean_obj_arg stream, lean_obj_arg world);
+
 // ============================================================================
 // Server Streaming Call
 // ============================================================================
@@ -103,6 +106,9 @@ LEAN_EXPORT lean_obj_res legate_server_stream_read(b_lean_obj_arg stream, lean_o
 
 // Get trailing metadata after stream ends
 LEAN_EXPORT lean_obj_res legate_server_stream_get_trailers(b_lean_obj_arg stream, lean_obj_arg world);
+
+// Get initial metadata (response headers) from a server stream
+LEAN_EXPORT lean_obj_res legate_server_stream_get_headers(b_lean_obj_arg stream, lean_obj_arg world);
 
 // Get the final status
 LEAN_EXPORT lean_obj_res legate_server_stream_get_status(b_lean_obj_arg stream, lean_obj_arg world);
@@ -139,6 +145,9 @@ LEAN_EXPORT lean_obj_res legate_bidi_stream_get_status(b_lean_obj_arg stream, le
 
 // Get trailing metadata from bidi stream
 LEAN_EXPORT lean_obj_res legate_bidi_stream_get_trailers(b_lean_obj_arg stream, lean_obj_arg world);
+
+// Get initial metadata (response headers) from a bidi stream
+LEAN_EXPORT lean_obj_res legate_bidi_stream_get_headers(b_lean_obj_arg stream, lean_obj_arg world);
 
 // ============================================================================
 // Server operations

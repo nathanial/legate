@@ -11,10 +11,12 @@ import Legate.Internal.FFI
 
 namespace Legate
 
-/-- Result of a unary call: response bytes and trailing metadata -/
+/-- Result of a unary call: response bytes, headers, and trailing metadata -/
 structure UnaryResponse where
   /-- The response payload -/
   data : ByteArray
+  /-- Server initial metadata (response headers) -/
+  headers : Metadata
   /-- Server trailing metadata -/
   trailers : Metadata
 
@@ -38,7 +40,7 @@ def unaryCall
   let result ← Internal.unaryCall
     channel.toInternal method request options.timeoutMs options.metadata
   match result with
-  | .ok (data, trailers) => return .ok { data, trailers }
+  | .ok (data, headers, trailers) => return .ok { data, headers, trailers }
   | .error e => return .error e
 
 /-- Convenience function for unary calls that only need the response data -/

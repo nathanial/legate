@@ -52,21 +52,21 @@ structure Server where
 -- Handler Types
 -- ============================================================================
 
-/-- Handler for unary RPCs: receives request, returns response -/
+/-- Handler for unary RPCs: receives request, returns (response, headers, trailers) -/
 abbrev UnaryHandler :=
-  ServerContext → ByteArray → IO (GrpcResult (ByteArray × Metadata))
+  ServerContext → ByteArray → IO (GrpcResult (ByteArray × Metadata × Metadata))
 
-/-- Handler for client streaming RPCs: receives stream of requests, returns response -/
+/-- Handler for client streaming RPCs: receives stream of requests, returns (response, headers, trailers) -/
 abbrev ClientStreamingHandler :=
-  ServerContext → (IO (Option ByteArray)) → IO (GrpcResult (ByteArray × Metadata))
+  ServerContext → (IO (Option ByteArray)) → IO (GrpcResult (ByteArray × Metadata × Metadata))
 
-/-- Handler for server streaming RPCs: receives request, writes to response stream -/
+/-- Handler for server streaming RPCs: receives request, writes to response stream, returns (headers, trailers) -/
 abbrev ServerStreamingHandler :=
-  ServerContext → ByteArray → (ByteArray → IO Unit) → IO (GrpcResult Metadata)
+  ServerContext → ByteArray → (ByteArray → IO Unit) → IO (GrpcResult (Metadata × Metadata))
 
-/-- Handler for bidirectional streaming RPCs -/
+/-- Handler for bidirectional streaming RPCs: returns (headers, trailers) -/
 abbrev BidiStreamingHandler :=
-  ServerContext → (IO (Option ByteArray)) → (ByteArray → IO Unit) → IO (GrpcResult Metadata)
+  ServerContext → (IO (Option ByteArray)) → (ByteArray → IO Unit) → IO (GrpcResult (Metadata × Metadata))
 
 /-- Type of service handler -/
 inductive HandlerType where
@@ -227,7 +227,8 @@ end Server
     ```lean
     Legate.runServer "0.0.0.0:50051" fun builder => do
       builder.registerUnary "/example.Echo/Echo" fun ctx req =>
-        return .ok (req, #[])
+        -- Return (response, headers, trailers)
+        return .ok (req, #[], #[])
     ```
 -/
 def runServer (addr : String) (configure : ServerBuilder → IO Unit) : IO Unit := do

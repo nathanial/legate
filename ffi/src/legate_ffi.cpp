@@ -53,9 +53,15 @@ struct StreamWrapperBase {
     std::unique_ptr<grpc::ClientContext> context;
     grpc::Status status;
     std::multimap<grpc::string_ref, grpc::string_ref> trailing_metadata;
+    bool initial_metadata_received = false;
 
     StreamWrapperBase() : context(std::make_unique<grpc::ClientContext>()) {}
     virtual ~StreamWrapperBase() = default;
+
+    // Get initial metadata (response headers) - available after first read or finish
+    const std::multimap<grpc::string_ref, grpc::string_ref>& getInitialMetadata() {
+        return context->GetServerInitialMetadata();
+    }
 };
 
 // Client streaming call wrapper - using ReaderWriter for all streaming
@@ -494,8 +500,8 @@ static void apply_metadata(grpc::ClientContext* ctx, b_lean_obj_arg metadata) {
     }
 }
 
-// Convert gRPC trailing metadata to Lean array
-static lean_object* trailing_metadata_to_lean(
+// Convert gRPC metadata (trailing or initial) to Lean array
+static lean_object* metadata_to_lean(
     const std::multimap<grpc::string_ref, grpc::string_ref>& metadata
 ) {
     lean_object* arr = lean_mk_empty_array();
@@ -506,6 +512,20 @@ static lean_object* trailing_metadata_to_lean(
         arr = lean_array_push(arr, pair);
     }
     return arr;
+}
+
+// Alias for backwards compatibility - convert gRPC trailing metadata to Lean array
+static lean_object* trailing_metadata_to_lean(
+    const std::multimap<grpc::string_ref, grpc::string_ref>& metadata
+) {
+    return metadata_to_lean(metadata);
+}
+
+// Convert gRPC initial metadata (response headers) to Lean array
+static lean_object* initial_metadata_to_lean(
+    const std::multimap<grpc::string_ref, grpc::string_ref>& metadata
+) {
+    return metadata_to_lean(metadata);
 }
 
 // Apply timeout to context
@@ -524,6 +544,17 @@ static void apply_trailing_metadata(grpc::ServerContext* ctx, b_lean_obj_arg met
         lean_object* key = lean_ctor_get(pair, 0);
         lean_object* val = lean_ctor_get(pair, 1);
         ctx->AddTrailingMetadata(lean_string_to_std(key), lean_string_to_std(val));
+    }
+}
+
+// Apply Lean Metadata (Array (String × String)) as initial metadata on a server context
+static void apply_initial_metadata(grpc::ServerContext* ctx, b_lean_obj_arg metadata) {
+    size_t len = lean_array_size(metadata);
+    for (size_t i = 0; i < len; i++) {
+        lean_object* pair = lean_array_get_core(metadata, i);
+        lean_object* key = lean_ctor_get(pair, 0);
+        lean_object* val = lean_ctor_get(pair, 1);
+        ctx->AddInitialMetadata(lean_string_to_std(key), lean_string_to_std(val));
     }
 }
 
@@ -639,9 +670,13 @@ extern "C" LEAN_EXPORT lean_obj_res legate_unary_call(
 
     if (status.ok()) {
         lean_object* response = bytebuffer_to_lean_bytearray(response_buf);
+        lean_object* headers = initial_metadata_to_lean(context.GetServerInitialMetadata());
         lean_object* trailers = trailing_metadata_to_lean(context.GetServerTrailingMetadata());
-        lean_object* pair = mk_pair(response, trailers);
-        return mk_io_result_ok(mk_except_ok(pair));
+        // Return (ByteArray × Metadata × Metadata) = (data, headers, trailers)
+        // Lean tuple (A × B × C) is (A × (B × C)), so nest the pairs
+        lean_object* inner = mk_pair(headers, trailers);
+        lean_object* result = mk_pair(response, inner);
+        return mk_io_result_ok(mk_except_ok(result));
     } else {
         return mk_io_result_ok(mk_except_error(status));
     }
@@ -780,6 +815,17 @@ extern "C" LEAN_EXPORT lean_obj_res legate_client_stream_finish(
     }
 }
 
+extern "C" LEAN_EXPORT lean_obj_res legate_client_stream_get_headers(
+    b_lean_obj_arg stream,
+    lean_obj_arg /* world */
+) {
+    auto* wrapper = static_cast<ClientStreamWrapper*>(lean_get_external_data(stream));
+    // Initial metadata is available after first communication with server
+    lean_object* headers = initial_metadata_to_lean(
+        wrapper->context->GetServerInitialMetadata());
+    return mk_io_result_ok(headers);
+}
+
 // ============================================================================
 // Server Streaming Call
 // ============================================================================
@@ -874,6 +920,17 @@ extern "C" LEAN_EXPORT lean_obj_res legate_server_stream_get_trailers(
     lean_object* trailers = trailing_metadata_to_lean(
         wrapper->context->GetServerTrailingMetadata());
     return mk_io_result_ok(trailers);
+}
+
+extern "C" LEAN_EXPORT lean_obj_res legate_server_stream_get_headers(
+    b_lean_obj_arg stream,
+    lean_obj_arg /* world */
+) {
+    auto* wrapper = static_cast<ServerStreamWrapper*>(lean_get_external_data(stream));
+    // Initial metadata is available after first read or after call starts
+    lean_object* headers = initial_metadata_to_lean(
+        wrapper->context->GetServerInitialMetadata());
+    return mk_io_result_ok(headers);
 }
 
 extern "C" LEAN_EXPORT lean_obj_res legate_server_stream_get_status(
@@ -1042,6 +1099,17 @@ extern "C" LEAN_EXPORT lean_obj_res legate_bidi_stream_get_trailers(
     return mk_io_result_ok(trailers);
 }
 
+extern "C" LEAN_EXPORT lean_obj_res legate_bidi_stream_get_headers(
+    b_lean_obj_arg stream,
+    lean_obj_arg /* world */
+) {
+    auto* wrapper = static_cast<BidiStreamWrapper*>(lean_get_external_data(stream));
+    // Initial metadata is available after first read or after call starts
+    lean_object* headers = initial_metadata_to_lean(
+        wrapper->context->GetServerInitialMetadata());
+    return mk_io_result_ok(headers);
+}
+
 // ============================================================================
 // Server Operations
 // ============================================================================
@@ -1202,9 +1270,16 @@ static void handle_server_call(ServerCallContext* call_ctx) {
                 return;
             }
 
-            // ok_value : (ByteArray × Metadata)
+            // ok_value : (ByteArray × Metadata × Metadata) = (response, headers, trailers)
+            // Lean tuple (A × B × C) is (A × (B × C)), so we need to unpack nested pairs
             lean_object* response_bytes = lean_ctor_get(ok_value, 0);
-            lean_object* trailers = lean_ctor_get(ok_value, 1);
+            lean_object* inner_pair = lean_ctor_get(ok_value, 1);
+            lean_object* headers = lean_ctor_get(inner_pair, 0);
+            lean_object* trailers = lean_ctor_get(inner_pair, 1);
+
+            // Apply initial metadata (response headers)
+            apply_initial_metadata(&call_ctx->ctx, headers);
+            // Apply trailing metadata
             apply_trailing_metadata(&call_ctx->ctx, trailers);
 
             grpc::ByteBuffer response = lean_bytearray_to_bytebuffer(response_bytes);
@@ -1257,9 +1332,16 @@ static void handle_server_call(ServerCallContext* call_ctx) {
                 return;
             }
 
-            // ok_value : (ByteArray × Metadata)
+            // ok_value : (ByteArray × Metadata × Metadata) = (response, headers, trailers)
+            // Lean tuple (A × B × C) is (A × (B × C)), so we need to unpack nested pairs
             lean_object* response_bytes = lean_ctor_get(ok_value, 0);
-            lean_object* trailers = lean_ctor_get(ok_value, 1);
+            lean_object* inner_pair = lean_ctor_get(ok_value, 1);
+            lean_object* headers = lean_ctor_get(inner_pair, 0);
+            lean_object* trailers = lean_ctor_get(inner_pair, 1);
+
+            // Apply initial metadata (response headers)
+            apply_initial_metadata(&call_ctx->ctx, headers);
+            // Apply trailing metadata
             apply_trailing_metadata(&call_ctx->ctx, trailers);
 
             grpc::ByteBuffer response = lean_bytearray_to_bytebuffer(response_bytes);
@@ -1321,8 +1403,15 @@ static void handle_server_call(ServerCallContext* call_ctx) {
                 return;
             }
 
-            // ok_value : Metadata
-            apply_trailing_metadata(&call_ctx->ctx, ok_value);
+            // ok_value : (Metadata × Metadata) = (headers, trailers)
+            lean_object* headers = lean_ctor_get(ok_value, 0);
+            lean_object* trailers = lean_ctor_get(ok_value, 1);
+
+            // Apply initial metadata (response headers)
+            // Note: For streaming, headers are sent with the first message if not already sent
+            apply_initial_metadata(&call_ctx->ctx, headers);
+            // Apply trailing metadata
+            apply_trailing_metadata(&call_ctx->ctx, trailers);
             lean_dec(ok_value);
             lean_dec(io_result);
 
@@ -1371,7 +1460,15 @@ static void handle_server_call(ServerCallContext* call_ctx) {
                 return;
             }
 
-            apply_trailing_metadata(&call_ctx->ctx, ok_value);
+            // ok_value : (Metadata × Metadata) = (headers, trailers)
+            lean_object* headers = lean_ctor_get(ok_value, 0);
+            lean_object* trailers = lean_ctor_get(ok_value, 1);
+
+            // Apply initial metadata (response headers)
+            // Note: For streaming, headers are sent with the first message if not already sent
+            apply_initial_metadata(&call_ctx->ctx, headers);
+            // Apply trailing metadata
+            apply_trailing_metadata(&call_ctx->ctx, trailers);
             lean_dec(ok_value);
             lean_dec(io_result);
 

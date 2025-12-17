@@ -24,6 +24,8 @@ structure ClientStreamWriter where
 structure ClientStreamResponse where
   /-- The response payload -/
   data : ByteArray
+  /-- Server initial metadata (response headers) -/
+  headers : Metadata
   /-- Server trailing metadata -/
   trailers : Metadata
   /-- Final status -/
@@ -43,8 +45,15 @@ def writesDone (stream : ClientStreamWriter) : IO (GrpcResult Unit) :=
 def finish (stream : ClientStreamWriter) : IO (GrpcResult ClientStreamResponse) := do
   let result ← Internal.clientStreamFinish stream.handle
   match result with
-  | .ok (data, trailers, status) => return .ok { data, trailers, status }
+  | .ok (data, trailers, status) =>
+    -- Get headers (initial metadata) - available after finish
+    let headers ← Internal.clientStreamGetHeaders stream.handle
+    return .ok { data, headers, trailers, status }
   | .error e => return .error e
+
+/-- Get initial metadata (response headers) -/
+def getHeaders (stream : ClientStreamWriter) : IO Metadata :=
+  Internal.clientStreamGetHeaders stream.handle
 
 /-- Write multiple messages to the stream -/
 def writeAll (stream : ClientStreamWriter) (messages : Array ByteArray) : IO (GrpcResult Unit) := do
@@ -84,6 +93,10 @@ namespace ServerStreamReader
 -/
 def read (stream : ServerStreamReader) : IO (GrpcResult (Option ByteArray)) :=
   Internal.serverStreamRead stream.handle
+
+/-- Get initial metadata (response headers) -/
+def getHeaders (stream : ServerStreamReader) : IO Metadata :=
+  Internal.serverStreamGetHeaders stream.handle
 
 /-- Get trailing metadata (available after stream ends) -/
 def getTrailers (stream : ServerStreamReader) : IO Metadata :=
@@ -167,6 +180,10 @@ def read (stream : BidiStream) : IO (GrpcResult (Option ByteArray)) :=
 /-- Get the final status -/
 def getStatus (stream : BidiStream) : IO Status :=
   Internal.bidiStreamGetStatus stream.handle
+
+/-- Get initial metadata (response headers) -/
+def getHeaders (stream : BidiStream) : IO Metadata :=
+  Internal.bidiStreamGetHeaders stream.handle
 
 /-- Get trailing metadata (available after stream ends) -/
 def getTrailers (stream : BidiStream) : IO Metadata :=
