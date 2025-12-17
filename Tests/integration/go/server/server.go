@@ -117,17 +117,35 @@ func (s *Server) Collect(stream pb.TestService_CollectServer) error {
 	if err := maybeSetHeaderFromIncomingMD(stream.Context(), md); err != nil {
 		log.Printf("Collect: failed to send header: %v", err)
 	}
+	// Check if we should delay (for deadline/cancellation testing)
+	delayMs := 0
+	if vals := md.Get("x-delay-ms"); len(vals) > 0 {
+		if d, err := strconv.Atoi(vals[0]); err == nil {
+			delayMs = d
+		}
+	}
 	var parts [][]byte
 	for {
+		// Check for cancellation
+		select {
+		case <-stream.Context().Done():
+			log.Printf("Collect: cancelled after %d messages", len(parts))
+			return status.FromContextError(stream.Context().Err()).Err()
+		default:
+		}
 		req, err := stream.Recv()
 		if err == io.EOF {
 			break
 		}
 		if err != nil {
+			log.Printf("Collect: recv error after %d messages: %v", len(parts), err)
 			return err
 		}
 		log.Printf("Collect: received chunk %d bytes", len(req.Data))
 		parts = append(parts, req.Data)
+		if delayMs > 0 {
+			time.Sleep(time.Duration(delayMs) * time.Millisecond)
+		}
 	}
 
 	joined := bytes.Join(parts, []byte("|"))
@@ -146,14 +164,32 @@ func (s *Server) Expand(req *pb.ExpandRequest, stream pb.TestService_ExpandServe
 	if err := maybeSetHeaderFromIncomingMD(stream.Context(), md); err != nil {
 		log.Printf("Expand: failed to send header: %v", err)
 	}
-	log.Printf("Expand: generating %d responses with prefix %q", req.Count, string(req.Prefix))
+	// Check if we should delay between sends (for cancellation testing)
+	delayMs := 0
+	if vals := md.Get("x-delay-ms"); len(vals) > 0 {
+		if d, err := strconv.Atoi(vals[0]); err == nil {
+			delayMs = d
+		}
+	}
+	log.Printf("Expand: generating %d responses with prefix %q (delay=%dms)", req.Count, string(req.Prefix), delayMs)
 	for i := int32(0); i < req.Count; i++ {
+		// Check for cancellation before sending
+		select {
+		case <-stream.Context().Done():
+			log.Printf("Expand: cancelled after %d messages", i)
+			return status.FromContextError(stream.Context().Err()).Err()
+		default:
+		}
 		data := fmt.Sprintf("%s:%d", string(req.Prefix), i)
 		if err := stream.Send(&pb.ExpandResponse{
 			Data:     []byte(data),
 			Sequence: i,
 		}); err != nil {
+			log.Printf("Expand: send error after %d messages: %v", i, err)
 			return err
+		}
+		if delayMs > 0 {
+			time.Sleep(time.Duration(delayMs) * time.Millisecond)
 		}
 	}
 	return nil
@@ -167,13 +203,28 @@ func (s *Server) BiEcho(stream pb.TestService_BiEchoServer) error {
 	if err := maybeSetHeaderFromIncomingMD(stream.Context(), md); err != nil {
 		log.Printf("BiEcho: failed to send header: %v", err)
 	}
+	// Check if we should delay (for deadline/cancellation testing)
+	delayMs := 0
+	if vals := md.Get("x-delay-ms"); len(vals) > 0 {
+		if d, err := strconv.Atoi(vals[0]); err == nil {
+			delayMs = d
+		}
+	}
 	seq := int32(0)
 	for {
+		// Check for cancellation
+		select {
+		case <-stream.Context().Done():
+			log.Printf("BiEcho: cancelled after %d messages", seq)
+			return status.FromContextError(stream.Context().Err()).Err()
+		default:
+		}
 		req, err := stream.Recv()
 		if err == io.EOF {
 			return nil
 		}
 		if err != nil {
+			log.Printf("BiEcho: recv error after %d messages: %v", seq, err)
 			return err
 		}
 
@@ -183,8 +234,12 @@ func (s *Server) BiEcho(stream pb.TestService_BiEchoServer) error {
 			Data:     []byte(data),
 			Sequence: seq,
 		}); err != nil {
+			log.Printf("BiEcho: send error after %d messages: %v", seq, err)
 			return err
 		}
 		seq++
+		if delayMs > 0 {
+			time.Sleep(time.Duration(delayMs) * time.Millisecond)
+		}
 	}
 }

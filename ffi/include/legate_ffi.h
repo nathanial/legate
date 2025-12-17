@@ -85,6 +85,9 @@ LEAN_EXPORT lean_obj_res legate_client_stream_finish(b_lean_obj_arg stream, lean
 // Get initial metadata (response headers) from a client stream
 LEAN_EXPORT lean_obj_res legate_client_stream_get_headers(b_lean_obj_arg stream, lean_obj_arg world);
 
+// Cancel the client stream
+LEAN_EXPORT lean_obj_res legate_client_stream_cancel(b_lean_obj_arg stream, lean_obj_arg world);
+
 // ============================================================================
 // Server Streaming Call
 // ============================================================================
@@ -112,6 +115,9 @@ LEAN_EXPORT lean_obj_res legate_server_stream_get_headers(b_lean_obj_arg stream,
 
 // Get the final status
 LEAN_EXPORT lean_obj_res legate_server_stream_get_status(b_lean_obj_arg stream, lean_obj_arg world);
+
+// Cancel the server stream
+LEAN_EXPORT lean_obj_res legate_server_stream_cancel(b_lean_obj_arg stream, lean_obj_arg world);
 
 // ============================================================================
 // Bidirectional Streaming Call
@@ -148,6 +154,9 @@ LEAN_EXPORT lean_obj_res legate_bidi_stream_get_trailers(b_lean_obj_arg stream, 
 
 // Get initial metadata (response headers) from a bidi stream
 LEAN_EXPORT lean_obj_res legate_bidi_stream_get_headers(b_lean_obj_arg stream, lean_obj_arg world);
+
+// Cancel the bidi stream
+LEAN_EXPORT lean_obj_res legate_bidi_stream_cancel(b_lean_obj_arg stream, lean_obj_arg world);
 
 // ============================================================================
 // Server operations

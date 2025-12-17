@@ -826,6 +826,17 @@ extern "C" LEAN_EXPORT lean_obj_res legate_client_stream_get_headers(
     return mk_io_result_ok(headers);
 }
 
+extern "C" LEAN_EXPORT lean_obj_res legate_client_stream_cancel(
+    b_lean_obj_arg stream,
+    lean_obj_arg /* world */
+) {
+    auto* wrapper = static_cast<ClientStreamWrapper*>(lean_get_external_data(stream));
+    if (wrapper && wrapper->context) {
+        wrapper->context->TryCancel();
+    }
+    return mk_io_result_ok(lean_box(0));
+}
+
 // ============================================================================
 // Server Streaming Call
 // ============================================================================
@@ -948,6 +959,17 @@ extern "C" LEAN_EXPORT lean_obj_res legate_server_stream_get_status(
     }
 
     return mk_io_result_ok(mk_status(wrapper->status));
+}
+
+extern "C" LEAN_EXPORT lean_obj_res legate_server_stream_cancel(
+    b_lean_obj_arg stream,
+    lean_obj_arg /* world */
+) {
+    auto* wrapper = static_cast<ServerStreamWrapper*>(lean_get_external_data(stream));
+    if (wrapper && wrapper->context) {
+        wrapper->context->TryCancel();
+    }
+    return mk_io_result_ok(lean_box(0));
 }
 
 // ============================================================================
@@ -1108,6 +1130,17 @@ extern "C" LEAN_EXPORT lean_obj_res legate_bidi_stream_get_headers(
     lean_object* headers = initial_metadata_to_lean(
         wrapper->context->GetServerInitialMetadata());
     return mk_io_result_ok(headers);
+}
+
+extern "C" LEAN_EXPORT lean_obj_res legate_bidi_stream_cancel(
+    b_lean_obj_arg stream,
+    lean_obj_arg /* world */
+) {
+    auto* wrapper = static_cast<BidiStreamWrapper*>(lean_get_external_data(stream));
+    if (wrapper && wrapper->context) {
+        wrapper->context->TryCancel();
+    }
+    return mk_io_result_ok(lean_box(0));
 }
 
 // ============================================================================

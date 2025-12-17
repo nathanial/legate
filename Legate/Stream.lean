@@ -55,6 +55,10 @@ def finish (stream : ClientStreamWriter) : IO (GrpcResult ClientStreamResponse) 
 def getHeaders (stream : ClientStreamWriter) : IO Metadata :=
   Internal.clientStreamGetHeaders stream.handle
 
+/-- Cancel the stream. The server will see the call as cancelled. -/
+def cancel (stream : ClientStreamWriter) : IO Unit :=
+  Internal.clientStreamCancel stream.handle
+
 /-- Write multiple messages to the stream -/
 def writeAll (stream : ClientStreamWriter) (messages : Array ByteArray) : IO (GrpcResult Unit) := do
   for msg in messages do
@@ -137,6 +141,10 @@ partial def fold {α : Type} (stream : ServerStreamReader) (init : α) (f : α �
     | .error e => return .error e
   loop init
 
+/-- Cancel the stream. Subsequent reads will fail. -/
+def cancel (stream : ServerStreamReader) : IO Unit :=
+  Internal.serverStreamCancel stream.handle
+
 end ServerStreamReader
 
 /-- Start a server streaming call -/
@@ -205,6 +213,10 @@ partial def readAll (stream : BidiStream) : IO (GrpcResult (Array ByteArray)) :=
     | .ok none => return .ok acc
     | .error e => return .error e
   loop #[]
+
+/-- Cancel the stream. The server will see the call as cancelled. -/
+def cancel (stream : BidiStream) : IO Unit :=
+  Internal.bidiStreamCancel stream.handle
 
 end BidiStream
 

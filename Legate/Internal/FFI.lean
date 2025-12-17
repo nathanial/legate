@@ -137,6 +137,10 @@ opaque clientStreamFinish
 @[extern "legate_client_stream_get_headers"]
 opaque clientStreamGetHeaders (stream : @& ClientStream) : IO Metadata
 
+/-- Cancel the client stream -/
+@[extern "legate_client_stream_cancel"]
+opaque clientStreamCancel (stream : @& ClientStream) : IO Unit
+
 -- ============================================================================
 -- Server Streaming FFI
 -- ============================================================================
@@ -166,6 +170,10 @@ opaque serverStreamGetHeaders (stream : @& ServerStream) : IO Metadata
 /-- Get the final status -/
 @[extern "legate_server_stream_get_status"]
 opaque serverStreamGetStatus (stream : @& ServerStream) : IO Status
+
+/-- Cancel the server stream -/
+@[extern "legate_server_stream_cancel"]
+opaque serverStreamCancel (stream : @& ServerStream) : IO Unit
 
 -- ============================================================================
 -- Bidirectional Streaming FFI
@@ -206,6 +214,10 @@ opaque bidiStreamRead (stream : @& BidiStream) : IO (Except GrpcError (Option By
   /-- Get initial metadata (response headers) -/
   @[extern "legate_bidi_stream_get_headers"]
   opaque bidiStreamGetHeaders (stream : @& BidiStream) : IO Metadata
+
+  /-- Cancel the bidi stream -/
+  @[extern "legate_bidi_stream_cancel"]
+  opaque bidiStreamCancel (stream : @& BidiStream) : IO Unit
 
 -- ============================================================================
 -- Server FFI

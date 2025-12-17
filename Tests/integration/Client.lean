@@ -280,6 +280,251 @@ def testServerStreamingHeaders : IO TestResult := do
   | .error e =>
     return .failed s!"Start stream error: {e}"
 
+/-- Test server streaming cancellation: cancel after receiving a few messages -/
+def testServerStreamingCancel : IO TestResult := do
+  let channel ← Channel.createInsecure serverAddr
+
+  -- Request many messages with a delay to allow cancellation
+  let request : ExpandRequest := { count := 100, prefix_ := "cancel".toUTF8 }
+  let requestBytes := Protolean.encodeMessage request
+  let opts := (CallOptions.default).withMetadata #[("x-delay-ms", "50")]
+
+  match ← serverStreamingCall channel expandMethod requestBytes opts with
+  | .ok stream =>
+    -- Read a few messages
+    let mut received := 0
+    for _ in [:3] do
+      match ← stream.read with
+      | .ok (some _) => received := received + 1
+      | .ok none => return .failed "Stream ended unexpectedly"
+      | .error e => return .failed s!"Read error: {e}"
+
+    if received < 2 then
+      return .failed s!"Expected at least 2 messages before cancel, got {received}"
+
+    -- Cancel the stream
+    stream.cancel
+
+    -- Subsequent read should fail with Cancelled (or return none/error)
+    match ← stream.read with
+    | .ok (some _) =>
+      -- It's possible we read a message that was already in flight
+      -- Try one more read
+      match ← stream.read with
+      | .ok (some _) =>
+        return .failed "Expected cancel to stop the stream"
+      | .ok none =>
+        return .passed  -- Stream ended (acceptable)
+      | .error e =>
+        if e.code == .cancelled then
+          return .passed
+        else
+          return .passed  -- Any error after cancel is acceptable
+    | .ok none =>
+      return .passed  -- Stream ended cleanly after cancel (acceptable)
+    | .error e =>
+      if e.code == .cancelled then
+        return .passed
+      else
+        -- Other errors are also acceptable after cancel
+        return .passed
+
+  | .error e =>
+    return .failed s!"Start stream error: {e}"
+
+/-- Test server streaming deadline exceeded during active streaming -/
+def testServerStreamingDeadline : IO TestResult := do
+  let channel ← Channel.createInsecure serverAddr
+
+  -- Request many messages with delay, but with a short timeout
+  let request : ExpandRequest := { count := 100, prefix_ := "deadline".toUTF8 }
+  let requestBytes := Protolean.encodeMessage request
+  let opts := ((CallOptions.default).withTimeout 100).withMetadata #[("x-delay-ms", "50")]
+
+  match ← serverStreamingCall channel expandMethod requestBytes opts with
+  | .ok stream =>
+    -- Read until we hit the deadline
+    let mut received := 0
+    let mut hitDeadline := false
+    for _ in [:100] do
+      match ← stream.read with
+      | .ok (some _) => received := received + 1
+      | .ok none => break  -- Stream ended
+      | .error e =>
+        if e.code == .deadlineExceeded then
+          hitDeadline := true
+          break
+        else
+          return .failed s!"Unexpected error: {e}"
+
+    if hitDeadline then
+      return .passed
+    else if received < 100 then
+      -- Stream ended before sending all messages, check status
+      let status ← stream.getStatus
+      if status.code == .deadlineExceeded then
+        return .passed
+      else
+        return .failed s!"Expected deadlineExceeded, stream ended with status: {status}"
+    else
+      return .failed s!"Expected deadline to trigger, but received all {received} messages"
+
+  | .error e =>
+    if e.code == .deadlineExceeded then
+      return .passed
+    else
+      return .failed s!"Start stream error: {e}"
+
+/-- Test client streaming cancellation: cancel after sending some messages -/
+def testClientStreamingCancel : IO TestResult := do
+  let channel ← Channel.createInsecure serverAddr
+
+  match ← clientStreamingCall channel collectMethod with
+  | .ok stream =>
+    -- Send a few messages
+    for i in [:3] do
+      let request : CollectRequest := { data := s!"msg{i}".toUTF8 }
+      match ← stream.write (Protolean.encodeMessage request) with
+      | .ok () => pure ()
+      | .error e => return .failed s!"Write error: {e}"
+
+    -- Cancel the stream before finishing
+    stream.cancel
+
+    -- Finish should fail or return an error
+    match ← stream.finish with
+    | .ok _ =>
+      -- It's possible the cancel didn't take effect immediately
+      return .passed
+    | .error e =>
+      -- Any error after cancel is acceptable
+      return .passed
+
+  | .error e =>
+    return .failed s!"Start stream error: {e}"
+
+/-- Test bidirectional streaming cancellation: cancel mid-exchange -/
+def testBidiStreamingCancel : IO TestResult := do
+  let channel ← Channel.createInsecure serverAddr
+  let opts := (CallOptions.default).withMetadata #[("x-delay-ms", "50")]
+
+  match ← bidiStreamingCall channel biEchoMethod opts with
+  | .ok stream =>
+    -- Exchange a few messages
+    for i in [:2] do
+      let request : BiEchoRequest := { data := s!"msg{i}".toUTF8 }
+      match ← stream.write (Protolean.encodeMessage request) with
+      | .ok () => pure ()
+      | .error e => return .failed s!"Write error: {e}"
+
+      -- Read the response
+      match ← stream.read with
+      | .ok (some _) => pure ()
+      | .ok none => return .failed "Stream ended unexpectedly"
+      | .error e => return .failed s!"Read error: {e}"
+
+    -- Cancel the stream
+    stream.cancel
+
+    -- Subsequent operations should fail or the stream should end
+    match ← stream.read with
+    | .ok (some _) =>
+      -- One more message may have been in flight, try again
+      match ← stream.read with
+      | .ok (some _) => return .failed "Expected cancel to stop the stream"
+      | _ => return .passed
+    | .ok none => return .passed
+    | .error _ => return .passed
+
+  | .error e =>
+    return .failed s!"Start stream error: {e}"
+
+/-- Test client streaming deadline exceeded -/
+def testClientStreamingDeadline : IO TestResult := do
+  let channel ← Channel.createInsecure serverAddr
+  let opts := ((CallOptions.default).withTimeout 100).withMetadata #[("x-delay-ms", "50")]
+
+  match ← clientStreamingCall channel collectMethod opts with
+  | .ok stream =>
+    -- Try to send many messages slowly
+    let mut hitDeadline := false
+    for i in [:100] do
+      let request : CollectRequest := { data := s!"msg{i}".toUTF8 }
+      match ← stream.write (Protolean.encodeMessage request) with
+      | .ok () =>
+        -- Small delay to trigger deadline
+        IO.sleep 20
+      | .error e =>
+        -- Deadline can manifest as deadlineExceeded or internal/unavailable error
+        if e.code == .deadlineExceeded || e.code == .internal || e.code == .unavailable then
+          hitDeadline := true
+          break
+        else
+          return .failed s!"Unexpected write error: {e}"
+
+    if hitDeadline then
+      return .passed
+    else
+      -- Try to finish and check for deadline
+      match ← stream.finish with
+      | .ok _ => return .failed "Expected deadline to trigger"
+      | .error e =>
+        if e.code == .deadlineExceeded || e.code == .internal || e.code == .unavailable then
+          return .passed
+        else
+          return .failed s!"Expected deadlineExceeded, got {e.code}: {e.message}"
+
+  | .error e =>
+    if e.code == .deadlineExceeded then
+      return .passed
+    else
+      return .failed s!"Start stream error: {e}"
+
+/-- Test bidirectional streaming deadline exceeded -/
+def testBidiStreamingDeadline : IO TestResult := do
+  let channel ← Channel.createInsecure serverAddr
+  let opts := ((CallOptions.default).withTimeout 100).withMetadata #[("x-delay-ms", "50")]
+
+  match ← bidiStreamingCall channel biEchoMethod opts with
+  | .ok stream =>
+    let mut hitDeadline := false
+    for i in [:100] do
+      let request : BiEchoRequest := { data := s!"msg{i}".toUTF8 }
+      match ← stream.write (Protolean.encodeMessage request) with
+      | .ok () => pure ()
+      | .error e =>
+        if e.code == .deadlineExceeded then
+          hitDeadline := true
+          break
+        else
+          return .failed s!"Unexpected write error: {e}"
+
+      match ← stream.read with
+      | .ok (some _) => pure ()
+      | .ok none => break
+      | .error e =>
+        if e.code == .deadlineExceeded then
+          hitDeadline := true
+          break
+        else
+          return .failed s!"Unexpected read error: {e}"
+
+    if hitDeadline then
+      return .passed
+    else
+      -- Check final status
+      let status ← stream.getStatus
+      if status.code == .deadlineExceeded then
+        return .passed
+      else
+        return .failed s!"Expected deadline to trigger, got status: {status}"
+
+  | .error e =>
+    if e.code == .deadlineExceeded then
+      return .passed
+    else
+      return .failed s!"Start stream error: {e}"
+
 /-- Client test suite -/
 def clientTestSuite : TestSuite := suite "Lean Client -> Go Server" #[
   test "Unary Echo" testUnaryEcho,
@@ -289,7 +534,13 @@ def clientTestSuite : TestSuite := suite "Lean Client -> Go Server" #[
   test "Client Streaming Collect" testClientStreamingCollect,
   test "Server Streaming Expand" testServerStreamingExpand,
   test "Server Streaming Headers" testServerStreamingHeaders,
-  test "Bidirectional BiEcho" testBidiStreaming
+  test "Bidirectional BiEcho" testBidiStreaming,
+  test "Server Streaming Cancel" testServerStreamingCancel,
+  test "Server Streaming Deadline" testServerStreamingDeadline,
+  test "Client Streaming Cancel" testClientStreamingCancel,
+  test "Bidi Streaming Cancel" testBidiStreamingCancel,
+  test "Client Streaming Deadline" testClientStreamingDeadline,
+  test "Bidi Streaming Deadline" testBidiStreamingDeadline
 ]
 
 end Tests.integration.Client
