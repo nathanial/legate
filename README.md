@@ -182,6 +182,58 @@ BidiStream.writesDone : IO (GrpcResult Unit)
 └─────────────────────────────────────────┘
 ```
 
+## Testing
+
+Run the complete test suite (unit + integration tests):
+
+```bash
+./run-tests.sh
+```
+
+Or run tests separately:
+
+```bash
+# Lean unit tests only
+lake test
+
+# Go gRPC integration tests only
+cd tests/integration/go
+make build
+./testapp server -port 50051 &
+./testapp client -addr localhost:50051 -test all
+```
+
+The integration tests use a Go gRPC application that acts as both server and client to verify all four RPC patterns work correctly with real gRPC communication.
+
+## Project Structure
+
+```
+legate/
+├── Legate.lean              # Main library entry point
+├── Legate/
+│   ├── Call.lean            # Unary RPC
+│   ├── Channel.lean         # Client channels
+│   ├── Error.lean           # Error types and status codes
+│   ├── Metadata.lean        # Headers/trailers/options
+│   ├── Server.lean          # Server-side API
+│   ├── Status.lean          # RPC status
+│   ├── Stream.lean          # Streaming RPC
+│   └── Internal/
+│       └── FFI.lean         # Low-level FFI bindings
+├── ffi/
+│   ├── CMakeLists.txt       # CMake build config
+│   └── src/
+│       └── legate_ffi.cpp   # C++ gRPC wrapper
+├── Tests/                   # Lean unit tests
+├── tests/
+│   └── integration/
+│       └── go/              # Go gRPC integration tests
+├── third_party/
+│   └── grpc/                # gRPC C++ submodule
+├── lakefile.lean            # Lake build configuration
+└── run-tests.sh             # Test runner script
+```
+
 ## Project Status
 
 This library provides the core gRPC transport layer. Current status:
