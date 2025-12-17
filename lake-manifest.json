@@ -1,5 +1,15 @@
 {"version": "1.1.0",
  "packagesDir": ".lake/packages",
- "packages": [],
+ "packages":
+ [{"url": "https://github.com/nathanial/protolean",
+   "type": "git",
+   "subDir": null,
+   "scope": "",
+   "rev": "71ecf8426d9d783928dc2e240b56b6a63234a35e",
+   "name": "protolean",
+   "manifestFile": "lake-manifest.json",
+   "inputRev": "master",
+   "inherited": false,
+   "configFile": "lakefile.lean"}],
  "name": "legate",
  "lakeDir": ".lake"}

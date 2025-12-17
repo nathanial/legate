@@ -4,6 +4,8 @@ open Lake DSL System
 package legate where
   precompileModules := true
 
+require protolean from git "https://github.com/nathanial/protolean" @ "master"
+
 @[default_target]
 lean_lib Legate where
   roots := #[`Legate]
