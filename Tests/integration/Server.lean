@@ -35,6 +35,29 @@ def maybeWaitForCancel (ctx : ServerContext) : IO Bool := do
       IO.sleep 10
     return true
 
+/-- Check for x-return-error header and return error if present.
+    Format: "code:message" -/
+def maybeReturnError (ctx : ServerContext) : Option GrpcError :=
+  match ctx.metadata.get? "x-return-error" with
+  | none => none
+  | some s =>
+    let parts := s.splitOn ":"
+    match parts with
+    | [codeStr] =>
+      let code := StatusCode.fromNat (codeStr.toNat?.getD 2)
+      some (GrpcError.mk code "" none)
+    | codeStr :: msgParts =>
+      let code := StatusCode.fromNat (codeStr.toNat?.getD 2)
+      let msg := ":".intercalate msgParts
+      some (GrpcError.mk code msg none)
+    | _ => some (GrpcError.mk .unknown "Invalid error format" none)
+
+/-- Check for x-error-details header and return error details if present -/
+def maybeGetErrorDetails (ctx : ServerContext) : Option ByteArray :=
+  match ctx.metadata.get? "x-error-details" with
+  | none => none
+  | some s => some s.toUTF8
+
 /-- Echo headers: echo the x-legate-test header back as initial metadata -/
 def testHeaders (ctx : ServerContext) : Metadata :=
   match ctx.metadata.get? "x-legate-test" with
@@ -48,6 +71,10 @@ def handleEcho (ctx : ServerContext) (requestBytes : ByteArray)
     return .error (GrpcError.mk .cancelled "Cancelled" none)
 
   maybeSleepFromMetadata ctx
+
+  -- Check for error return request
+  if let some e := maybeReturnError ctx then
+    return .error { e with details := maybeGetErrorDetails ctx }
 
   match Protolean.decodeMessage (α := EchoRequest) requestBytes with
   | .ok request =>
@@ -63,6 +90,10 @@ def handleEcho (ctx : ServerContext) (requestBytes : ByteArray)
 -/
 def handleCollect (ctx : ServerContext) (recv : IO (Option ByteArray))
     : IO (GrpcResult (ByteArray × Metadata × Metadata)) := do
+  -- Check for error return request
+  if let some e := maybeReturnError ctx then
+    return .error { e with details := maybeGetErrorDetails ctx }
+
   -- Read all messages using a loop
   let mut parts : Array ByteArray := #[]
   let mut count : Int32 := 0
@@ -91,6 +122,10 @@ def handleCollect (ctx : ServerContext) (recv : IO (Option ByteArray))
 -/
 def handleExpand (ctx : ServerContext) (requestBytes : ByteArray) (send : ByteArray → IO Unit)
     : IO (GrpcResult (Metadata × Metadata)) := do
+  -- Check for error return request
+  if let some e := maybeReturnError ctx then
+    return .error { e with details := maybeGetErrorDetails ctx }
+
   match Protolean.decodeMessage (α := ExpandRequest) requestBytes with
   | .ok request =>
     for i in [:request.count.toInt.toNat] do
@@ -107,6 +142,10 @@ def handleExpand (ctx : ServerContext) (requestBytes : ByteArray) (send : ByteAr
 -/
 def handleBiEcho (ctx : ServerContext) (recv : IO (Option ByteArray)) (send : ByteArray → IO Unit)
     : IO (GrpcResult (Metadata × Metadata)) := do
+  -- Check for error return request
+  if let some e := maybeReturnError ctx then
+    return .error { e with details := maybeGetErrorDetails ctx }
+
   let mut seq : Int32 := 0
   let mut done := false
   while !done do

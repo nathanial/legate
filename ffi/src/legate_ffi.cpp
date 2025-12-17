@@ -349,8 +349,19 @@ static lean_object* mk_except_error(const grpc::Status& status) {
     std::string msg_s = status.error_message();
     lean_object* msg = lean_mk_string(msg_s.c_str());
 
-    // Details (Option ByteArray) - for now, always none
-    lean_object* details = lean_box(0);  // Option.none
+    // Details (Option ByteArray) - extract from grpc::Status::error_details()
+    lean_object* details;
+    std::string details_str = status.error_details();
+    if (details_str.empty()) {
+        details = lean_box(0);  // Option.none
+    } else {
+        // Create ByteArray from details string
+        lean_object* ba = lean_alloc_sarray(1, details_str.size(), details_str.size());
+        std::memcpy(lean_sarray_cptr(ba), details_str.data(), details_str.size());
+        // Wrap in Option.some
+        details = lean_alloc_ctor(1, 1, 0);
+        lean_ctor_set(details, 0, ba);
+    }
 
     // Create GrpcError structure
     lean_object* grpc_error = lean_alloc_ctor(0, 2, 1);
@@ -561,13 +572,29 @@ static void apply_initial_metadata(grpc::ServerContext* ctx, b_lean_obj_arg meta
 // Create Lean Status structure
 static lean_object* mk_status(const grpc::Status& status) {
     // Status layout (from generated C):
-    //   ctor tag 0, 1 pointer field: (message), 1 scalar (uint8): code.
+    //   ctor tag 0, 2 pointer fields: (message, details), 1 scalar (uint8): code.
     uint8_t code = static_cast<uint8_t>(status.error_code());
     std::string msg_s = status.error_message();
     lean_object* msg = lean_mk_string(msg_s.c_str());
-    lean_object* s = lean_alloc_ctor(0, 1, 1);
+
+    // Details (Option ByteArray) - extract from grpc::Status::error_details()
+    lean_object* details;
+    std::string details_str = status.error_details();
+    if (details_str.empty()) {
+        details = lean_box(0);  // Option.none
+    } else {
+        // Create ByteArray from details string
+        lean_object* ba = lean_alloc_sarray(1, details_str.size(), details_str.size());
+        std::memcpy(lean_sarray_cptr(ba), details_str.data(), details_str.size());
+        // Wrap in Option.some
+        details = lean_alloc_ctor(1, 1, 0);
+        lean_ctor_set(details, 0, ba);
+    }
+
+    lean_object* s = lean_alloc_ctor(0, 2, 1);
     lean_ctor_set(s, 0, msg);
-    lean_ctor_set_uint8(s, sizeof(void*) * 1, code);
+    lean_ctor_set(s, 1, details);
+    lean_ctor_set_uint8(s, sizeof(void*) * 2, code);
     return s;
 }
 
@@ -1164,12 +1191,13 @@ static lean_object* server_metadata_to_lean(
 // Helper to extract result from Except GrpcError α
 // Returns true if ok, false if error
 // On success, sets *result to the ok value
-// On error, sets *error_code and *error_msg
+// On error, sets *error_code, *error_msg, and optionally *error_details
 static bool extract_except_result(
     lean_object* except_result,
     lean_object** result,
     int* error_code,
-    std::string* error_msg
+    std::string* error_msg,
+    std::string* error_details = nullptr
 ) {
     // Except.error is ctor 0, Except.ok is ctor 1
     unsigned tag = lean_obj_tag(except_result);
@@ -1181,19 +1209,34 @@ static bool extract_except_result(
     } else {
         // Except.error - extract GrpcError
         lean_object* grpc_error = lean_ctor_get(except_result, 0);
-        // GrpcError is packed: msg at idx 0, code stored as uint8 after pointers.
+        // GrpcError is packed: msg at idx 0, details at idx 1, code stored as uint8 after pointers.
         uint8_t code = lean_ctor_get_uint8(grpc_error, sizeof(void*) * 2);
         lean_object* msg_obj = lean_ctor_get(grpc_error, 0);
         *error_code = static_cast<int>(code);
         *error_msg = lean_string_cstr(msg_obj);
+
+        // Extract details (Option ByteArray) if requested
+        if (error_details) {
+            lean_object* details_opt = lean_ctor_get(grpc_error, 1);
+            if (lean_obj_tag(details_opt) == 1) {
+                // Option.some - extract ByteArray
+                lean_object* ba = lean_ctor_get(details_opt, 0);
+                size_t len = lean_sarray_size(ba);
+                uint8_t* ptr = lean_sarray_cptr(ba);
+                *error_details = std::string(reinterpret_cast<char*>(ptr), len);
+            } else {
+                error_details->clear();
+            }
+        }
         return false;
     }
 }
 
 // Process a unary call - called from the server polling loop
-static grpc::Status grpc_status_from_lean_error(int error_code, const std::string& error_msg) {
+static grpc::Status grpc_status_from_lean_error(int error_code, const std::string& error_msg, const std::string& error_details = "") {
     // Lean StatusCode uses the same numeric mapping as gRPC core status codes.
-    return grpc::Status(static_cast<grpc::StatusCode>(error_code), error_msg);
+    // The third parameter is error_details (binary, typically google.rpc.Status protobuf)
+    return grpc::Status(static_cast<grpc::StatusCode>(error_code), error_msg, error_details);
 }
 
 static bool cq_wait_for_tag(grpc::CompletionQueue& cq, void* expected_tag, bool* ok_out) {
@@ -1297,9 +1340,10 @@ static void handle_server_call(ServerCallContext* call_ctx) {
             lean_object* ok_value = nullptr;
             int error_code = 0;
             std::string error_msg;
-            if (!extract_except_result(except_result, &ok_value, &error_code, &error_msg)) {
+            std::string error_details;
+            if (!extract_except_result(except_result, &ok_value, &error_code, &error_msg, &error_details)) {
                 lean_dec(io_result);
-                server_finish(call_ctx, grpc_status_from_lean_error(error_code, error_msg));
+                server_finish(call_ctx, grpc_status_from_lean_error(error_code, error_msg, error_details));
                 return;
             }
 
@@ -1359,9 +1403,10 @@ static void handle_server_call(ServerCallContext* call_ctx) {
             lean_object* ok_value = nullptr;
             int error_code = 0;
             std::string error_msg;
-            if (!extract_except_result(except_result, &ok_value, &error_code, &error_msg)) {
+            std::string error_details;
+            if (!extract_except_result(except_result, &ok_value, &error_code, &error_msg, &error_details)) {
                 lean_dec(io_result);
-                server_finish(call_ctx, grpc_status_from_lean_error(error_code, error_msg));
+                server_finish(call_ctx, grpc_status_from_lean_error(error_code, error_msg, error_details));
                 return;
             }
 
@@ -1430,9 +1475,10 @@ static void handle_server_call(ServerCallContext* call_ctx) {
             lean_object* ok_value = nullptr;
             int error_code = 0;
             std::string error_msg;
-            if (!extract_except_result(except_result, &ok_value, &error_code, &error_msg)) {
+            std::string error_details;
+            if (!extract_except_result(except_result, &ok_value, &error_code, &error_msg, &error_details)) {
                 lean_dec(io_result);
-                server_finish(call_ctx, grpc_status_from_lean_error(error_code, error_msg));
+                server_finish(call_ctx, grpc_status_from_lean_error(error_code, error_msg, error_details));
                 return;
             }
 
@@ -1487,9 +1533,10 @@ static void handle_server_call(ServerCallContext* call_ctx) {
             lean_object* ok_value = nullptr;
             int error_code = 0;
             std::string error_msg;
-            if (!extract_except_result(except_result, &ok_value, &error_code, &error_msg)) {
+            std::string error_details;
+            if (!extract_except_result(except_result, &ok_value, &error_code, &error_msg, &error_details)) {
                 lean_dec(io_result);
-                server_finish(call_ctx, grpc_status_from_lean_error(error_code, error_msg));
+                server_finish(call_ctx, grpc_status_from_lean_error(error_code, error_msg, error_details));
                 return;
             }
 

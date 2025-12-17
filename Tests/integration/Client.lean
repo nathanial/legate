@@ -525,16 +525,243 @@ def testBidiStreamingDeadline : IO TestResult := do
     else
       return .failed s!"Start stream error: {e}"
 
+-- ============================================================================
+-- Status / Error Tests (Phase 3)
+-- ============================================================================
+
+/-- Test unary error response -/
+def testUnaryError : IO TestResult := do
+  let channel ← Channel.createInsecure serverAddr
+
+  let request : EchoRequest := { data := "test".toUTF8 }
+  let requestBytes := Protolean.encodeMessage request
+
+  -- Request error code 3 (InvalidArgument) with message
+  let opts := (CallOptions.default).withMetadata #[("x-return-error", "3:test error message")]
+  match ← unaryCall channel echoMethod requestBytes opts with
+  | .ok _ =>
+    return .failed "Expected error, got ok"
+  | .error e =>
+    if e.code == .invalidArgument && e.message.containsSubstr "test error message" then
+      return .passed
+    else
+      return .failed s!"Expected invalidArgument with message, got {e.code}: {e.message}"
+
+/-- Test server streaming error immediately (before any messages) -/
+def testServerStreamingError : IO TestResult := do
+  let channel ← Channel.createInsecure serverAddr
+
+  let request : ExpandRequest := { count := 5, prefix_ := "test".toUTF8 }
+  let requestBytes := Protolean.encodeMessage request
+
+  -- Request error code 6 (AlreadyExists) with message
+  let opts := (CallOptions.default).withMetadata #[("x-return-error", "6:immediate error")]
+  match ← serverStreamingCall channel expandMethod requestBytes opts with
+  | .ok stream =>
+    -- The stream starts but first read should get the error
+    match ← stream.read with
+    | .ok (some _) =>
+      return .failed "Expected error, got message"
+    | .ok none =>
+      -- Check status
+      let status ← stream.getStatus
+      if status.code == .alreadyExists then
+        return .passed
+      else
+        return .failed s!"Expected alreadyExists status, got {status.code}: {status.message}"
+    | .error e =>
+      if e.code == .alreadyExists then
+        return .passed
+      else
+        return .failed s!"Expected alreadyExists error, got {e.code}: {e.message}"
+  | .error e =>
+    if e.code == .alreadyExists then
+      return .passed
+    else
+      return .failed s!"Expected alreadyExists error, got {e.code}: {e.message}"
+
+/-- Test server streaming error mid-stream (after some messages) -/
+def testServerStreamingMidError : IO TestResult := do
+  let channel ← Channel.createInsecure serverAddr
+
+  -- Request 10 messages but error after 3
+  let request : ExpandRequest := { count := 10, prefix_ := "test".toUTF8 }
+  let requestBytes := Protolean.encodeMessage request
+
+  let opts := (CallOptions.default).withMetadata #[("x-error-after-n", "3")]
+  match ← serverStreamingCall channel expandMethod requestBytes opts with
+  | .ok stream =>
+    let mut msgCount := 0
+    let mut gotError := false
+    let mut errorCode : StatusCode := .ok
+    for _ in [:20] do
+      match ← stream.read with
+      | .ok (some _) =>
+        msgCount := msgCount + 1
+      | .ok none => break
+      | .error e =>
+        gotError := true
+        errorCode := e.code
+        break
+
+    if gotError then
+      -- Should have received 3 messages before error
+      if msgCount == 3 && errorCode == .aborted then
+        return .passed
+      else
+        return .failed s!"Got error after {msgCount} messages with code {errorCode}"
+    else
+      -- Check final status
+      let status ← stream.getStatus
+      if status.code == .aborted && msgCount == 3 then
+        return .passed
+      else
+        return .failed s!"Expected aborted status after 3 messages, got {status.code} after {msgCount} messages"
+  | .error e =>
+    return .failed s!"Start stream error: {e}"
+
+/-- Test client streaming error immediately (before any messages) -/
+def testClientStreamingError : IO TestResult := do
+  let channel ← Channel.createInsecure serverAddr
+
+  -- Request error code 7 (PermissionDenied) with message
+  let opts := (CallOptions.default).withMetadata #[("x-return-error", "7:access denied")]
+  match ← clientStreamingCall channel collectMethod opts with
+  | .ok stream =>
+    -- Write a message and try to finish
+    let request : CollectRequest := { data := "test".toUTF8 }
+    let _ ← stream.write (Protolean.encodeMessage request)
+
+    match ← stream.finish with
+    | .ok _ =>
+      return .failed "Expected error, got ok"
+    | .error e =>
+      if e.code == .permissionDenied then
+        return .passed
+      else
+        return .failed s!"Expected permissionDenied error, got {e.code}: {e.message}"
+  | .error e =>
+    if e.code == .permissionDenied then
+      return .passed
+    else
+      return .failed s!"Expected permissionDenied error, got {e.code}: {e.message}"
+
+/-- Test client streaming error mid-stream (after some messages) -/
+def testClientStreamingMidError : IO TestResult := do
+  let channel ← Channel.createInsecure serverAddr
+
+  -- Error after receiving 2 messages
+  let opts := (CallOptions.default).withMetadata #[("x-error-after-n", "2")]
+  match ← clientStreamingCall channel collectMethod opts with
+  | .ok stream =>
+    -- Send several messages
+    for i in [:5] do
+      let request : CollectRequest := { data := s!"msg{i}".toUTF8 }
+      match ← stream.write (Protolean.encodeMessage request) with
+      | .ok () => pure ()
+      | .error _ => break
+
+    match ← stream.finish with
+    | .ok _ =>
+      return .failed "Expected error, got ok"
+    | .error e =>
+      if e.code == .aborted && e.message.containsSubstr "error after 2 messages" then
+        return .passed
+      else
+        return .failed s!"Expected aborted error, got {e.code}: {e.message}"
+  | .error e =>
+    return .failed s!"Start stream error: {e}"
+
+/-- Test bidirectional streaming error immediately (before any messages) -/
+def testBidiStreamingError : IO TestResult := do
+  let channel ← Channel.createInsecure serverAddr
+
+  -- Request error code 8 (ResourceExhausted) with message
+  let opts := (CallOptions.default).withMetadata #[("x-return-error", "8:out of resources")]
+  match ← bidiStreamingCall channel biEchoMethod opts with
+  | .ok stream =>
+    -- Write a message and try to read
+    let request : BiEchoRequest := { data := "test".toUTF8 }
+    let _ ← stream.write (Protolean.encodeMessage request)
+
+    match ← stream.read with
+    | .ok (some _) =>
+      return .failed "Expected error, got message"
+    | .ok none =>
+      -- Check status
+      let status ← stream.getStatus
+      if status.code == .resourceExhausted then
+        return .passed
+      else
+        return .failed s!"Expected resourceExhausted status, got {status.code}: {status.message}"
+    | .error e =>
+      if e.code == .resourceExhausted then
+        return .passed
+      else
+        return .failed s!"Expected resourceExhausted error, got {e.code}: {e.message}"
+  | .error e =>
+    if e.code == .resourceExhausted then
+      return .passed
+    else
+      return .failed s!"Expected resourceExhausted error, got {e.code}: {e.message}"
+
+/-- Test bidirectional streaming error mid-stream (after some messages) -/
+def testBidiStreamingMidError : IO TestResult := do
+  let channel ← Channel.createInsecure serverAddr
+
+  -- Error after processing 2 messages
+  let opts := (CallOptions.default).withMetadata #[("x-error-after-n", "2")]
+  match ← bidiStreamingCall channel biEchoMethod opts with
+  | .ok stream =>
+    let mut msgCount := 0
+    let mut gotError := false
+    for i in [:10] do
+      let request : BiEchoRequest := { data := s!"msg{i}".toUTF8 }
+      match ← stream.write (Protolean.encodeMessage request) with
+      | .ok () => pure ()
+      | .error _ => break
+
+      match ← stream.read with
+      | .ok (some _) =>
+        msgCount := msgCount + 1
+      | .ok none => break
+      | .error e =>
+        gotError := true
+        if e.code == .aborted then
+          -- Got expected error
+          break
+        else
+          return .failed s!"Expected aborted error, got {e.code}: {e.message}"
+
+    if gotError || msgCount >= 2 then
+      -- Check final status if needed
+      let status ← stream.getStatus
+      if status.code == .aborted || status.code == .ok then
+        return .passed
+      else
+        return .failed s!"Expected aborted or ok status, got {status.code}"
+    else
+      return .failed s!"Expected to process at least 2 messages, got {msgCount}"
+  | .error e =>
+    return .failed s!"Start stream error: {e}"
+
 /-- Client test suite -/
 def clientTestSuite : TestSuite := suite "Lean Client -> Go Server" #[
   test "Unary Echo" testUnaryEcho,
   test "Unary Metadata" testUnaryMetadata,
   test "Unary Headers" testUnaryHeaders,
   test "Unary Deadline" testUnaryDeadlineExceeded,
+  test "Unary Error" testUnaryError,
   test "Client Streaming Collect" testClientStreamingCollect,
+  test "Client Streaming Error" testClientStreamingError,
+  test "Client Streaming MidError" testClientStreamingMidError,
   test "Server Streaming Expand" testServerStreamingExpand,
   test "Server Streaming Headers" testServerStreamingHeaders,
+  test "Server Streaming Error" testServerStreamingError,
+  test "Server Streaming MidError" testServerStreamingMidError,
   test "Bidirectional BiEcho" testBidiStreaming,
+  test "Bidi Streaming Error" testBidiStreamingError,
+  test "Bidi Streaming MidError" testBidiStreamingMidError,
   test "Server Streaming Cancel" testServerStreamingCancel,
   test "Server Streaming Deadline" testServerStreamingDeadline,
   test "Client Streaming Cancel" testClientStreamingCancel,

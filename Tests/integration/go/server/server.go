@@ -8,9 +8,11 @@ import (
 	"log"
 	"net"
 	"strconv"
+	"strings"
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
@@ -68,6 +70,40 @@ func maybeWaitForCancel(ctx context.Context, md metadata.MD) error {
 	return status.FromContextError(ctx.Err()).Err()
 }
 
+// maybeReturnError checks for x-return-error header with format "code:message"
+// and returns an error if present. Also checks x-error-details for binary details.
+func maybeReturnError(md metadata.MD) error {
+	vals := md.Get("x-return-error")
+	if len(vals) == 0 {
+		return nil
+	}
+	// Parse "code:message" format
+	parts := strings.SplitN(vals[0], ":", 2)
+	code, err := strconv.Atoi(parts[0])
+	if err != nil {
+		code = int(codes.Unknown)
+	}
+	msg := ""
+	if len(parts) > 1 {
+		msg = parts[1]
+	}
+
+	// Check for optional error details
+	detailVals := md.Get("x-error-details")
+	if len(detailVals) > 0 {
+		// Return error with details
+		st := status.New(codes.Code(code), msg)
+		// gRPC error details are typically proto-encoded, but for testing
+		// we'll use the status.WithDetails API if we had proto messages.
+		// For raw binary details, we use the grpc-status-details-bin trailer.
+		// However, the standard Go API doesn't easily support raw binary details.
+		// For now, return error without rich details; we'll test via Lean server.
+		return st.Err()
+	}
+
+	return status.Error(codes.Code(code), msg)
+}
+
 // Start begins listening on the given address.
 func (s *Server) Start(addr string) error {
 	lis, err := net.Listen("tcp", addr)
@@ -102,6 +138,11 @@ func (s *Server) Echo(ctx context.Context, req *pb.EchoRequest) (*pb.EchoRespons
 	if err := maybeSleepFromIncomingMD(md); err != nil {
 		return nil, err
 	}
+	// Check if we should return an error
+	if err := maybeReturnError(md); err != nil {
+		log.Printf("Echo: returning error: %v", err)
+		return nil, err
+	}
 
 	log.Printf("Echo: received %d bytes", len(req.Data))
 	return &pb.EchoResponse{
@@ -117,11 +158,23 @@ func (s *Server) Collect(stream pb.TestService_CollectServer) error {
 	if err := maybeSetHeaderFromIncomingMD(stream.Context(), md); err != nil {
 		log.Printf("Collect: failed to send header: %v", err)
 	}
+	// Check if we should return an error immediately
+	if err := maybeReturnError(md); err != nil {
+		log.Printf("Collect: returning error immediately: %v", err)
+		return err
+	}
 	// Check if we should delay (for deadline/cancellation testing)
 	delayMs := 0
 	if vals := md.Get("x-delay-ms"); len(vals) > 0 {
 		if d, err := strconv.Atoi(vals[0]); err == nil {
 			delayMs = d
+		}
+	}
+	// Check if we should error after N messages
+	errorAfterN := -1
+	if vals := md.Get("x-error-after-n"); len(vals) > 0 {
+		if n, err := strconv.Atoi(vals[0]); err == nil {
+			errorAfterN = n
 		}
 	}
 	var parts [][]byte
@@ -143,6 +196,11 @@ func (s *Server) Collect(stream pb.TestService_CollectServer) error {
 		}
 		log.Printf("Collect: received chunk %d bytes", len(req.Data))
 		parts = append(parts, req.Data)
+		// Check if we should error after receiving N messages
+		if errorAfterN >= 0 && len(parts) >= errorAfterN {
+			log.Printf("Collect: returning error after %d messages", len(parts))
+			return status.Error(codes.Aborted, fmt.Sprintf("error after %d messages", len(parts)))
+		}
 		if delayMs > 0 {
 			time.Sleep(time.Duration(delayMs) * time.Millisecond)
 		}
@@ -164,11 +222,23 @@ func (s *Server) Expand(req *pb.ExpandRequest, stream pb.TestService_ExpandServe
 	if err := maybeSetHeaderFromIncomingMD(stream.Context(), md); err != nil {
 		log.Printf("Expand: failed to send header: %v", err)
 	}
+	// Check if we should return an error immediately
+	if err := maybeReturnError(md); err != nil {
+		log.Printf("Expand: returning error immediately: %v", err)
+		return err
+	}
 	// Check if we should delay between sends (for cancellation testing)
 	delayMs := 0
 	if vals := md.Get("x-delay-ms"); len(vals) > 0 {
 		if d, err := strconv.Atoi(vals[0]); err == nil {
 			delayMs = d
+		}
+	}
+	// Check if we should error after N messages
+	errorAfterN := -1
+	if vals := md.Get("x-error-after-n"); len(vals) > 0 {
+		if n, err := strconv.Atoi(vals[0]); err == nil {
+			errorAfterN = n
 		}
 	}
 	log.Printf("Expand: generating %d responses with prefix %q (delay=%dms)", req.Count, string(req.Prefix), delayMs)
@@ -179,6 +249,11 @@ func (s *Server) Expand(req *pb.ExpandRequest, stream pb.TestService_ExpandServe
 			log.Printf("Expand: cancelled after %d messages", i)
 			return status.FromContextError(stream.Context().Err()).Err()
 		default:
+		}
+		// Check if we should error after sending N messages
+		if errorAfterN >= 0 && int(i) >= errorAfterN {
+			log.Printf("Expand: returning error after %d messages", i)
+			return status.Error(codes.Aborted, fmt.Sprintf("error after %d messages", i))
 		}
 		data := fmt.Sprintf("%s:%d", string(req.Prefix), i)
 		if err := stream.Send(&pb.ExpandResponse{
@@ -203,11 +278,23 @@ func (s *Server) BiEcho(stream pb.TestService_BiEchoServer) error {
 	if err := maybeSetHeaderFromIncomingMD(stream.Context(), md); err != nil {
 		log.Printf("BiEcho: failed to send header: %v", err)
 	}
+	// Check if we should return an error immediately
+	if err := maybeReturnError(md); err != nil {
+		log.Printf("BiEcho: returning error immediately: %v", err)
+		return err
+	}
 	// Check if we should delay (for deadline/cancellation testing)
 	delayMs := 0
 	if vals := md.Get("x-delay-ms"); len(vals) > 0 {
 		if d, err := strconv.Atoi(vals[0]); err == nil {
 			delayMs = d
+		}
+	}
+	// Check if we should error after N messages
+	errorAfterN := -1
+	if vals := md.Get("x-error-after-n"); len(vals) > 0 {
+		if n, err := strconv.Atoi(vals[0]); err == nil {
+			errorAfterN = n
 		}
 	}
 	seq := int32(0)
@@ -229,6 +316,11 @@ func (s *Server) BiEcho(stream pb.TestService_BiEchoServer) error {
 		}
 
 		log.Printf("BiEcho: received message %d", seq)
+		// Check if we should error after processing N messages
+		if errorAfterN >= 0 && int(seq) >= errorAfterN {
+			log.Printf("BiEcho: returning error after %d messages", seq)
+			return status.Error(codes.Aborted, fmt.Sprintf("error after %d messages", seq))
+		}
 		data := fmt.Sprintf("%d:%s", seq, string(req.Data))
 		if err := stream.Send(&pb.BiEchoResponse{
 			Data:     []byte(data),

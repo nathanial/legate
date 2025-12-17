@@ -273,6 +273,30 @@ func (c *Client) TestUnaryCancel(data []byte) error {
 	return nil
 }
 
+// TestUnaryError verifies that the server can return a non-OK status with custom message.
+func (c *Client) TestUnaryError(data []byte) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Request error code 9 (FailedPrecondition) with message
+	ctx = metadata.AppendToOutgoingContext(ctx, "x-return-error", "9:server error test")
+	_, err := c.client.Echo(ctx, &pb.EchoRequest{Data: data})
+	if err == nil {
+		return fmt.Errorf("expected error, got nil")
+	}
+	st, ok := status.FromError(err)
+	if !ok {
+		return fmt.Errorf("expected grpc status error, got %T", err)
+	}
+	if st.Code() != codes.FailedPrecondition {
+		return fmt.Errorf("expected FailedPrecondition, got %s: %v", st.Code(), err)
+	}
+	if st.Message() != "server error test" {
+		return fmt.Errorf("expected message 'server error test', got %q", st.Message())
+	}
+	return nil
+}
+
 // TestAll runs all tests.
 func (c *Client) TestAll(data []byte, count int) error {
 	tests := []struct {
@@ -285,6 +309,7 @@ func (c *Client) TestAll(data []byte, count int) error {
 		{"bidi", func() error { return c.TestBidi(data, count) }},
 		{"deadline", func() error { return c.TestUnaryDeadlineExceeded(data) }},
 		{"cancel", func() error { return c.TestUnaryCancel(data) }},
+		{"error", func() error { return c.TestUnaryError(data) }},
 	}
 
 	for _, t := range tests {

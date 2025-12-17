@@ -127,7 +127,7 @@ partial def forEach (stream : ServerStreamReader) (f : ByteArray → IO Unit) : 
       f data
       loop
     | .ok none => stream.getStatus
-    | .error e => return ⟨e.code, e.message⟩
+    | .error e => return ⟨e.code, e.message, e.details⟩
   loop
 
 /-- Fold over all messages in the stream -/
