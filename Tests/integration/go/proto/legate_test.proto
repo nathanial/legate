@@ -1,0 +1,66 @@
+syntax = "proto3";
+
+package legate.test;
+
+option go_package = "legate/tests/integration/go/pb";
+
+// TestService exercises all 4 gRPC patterns for Legate integration testing.
+// Uses simple byte payloads for transport-only testing.
+service TestService {
+  // Unary: Echo back the request with "ECHO:" prefix
+  // Request: arbitrary bytes
+  // Response: "ECHO:" + request bytes
+  rpc Echo(EchoRequest) returns (EchoResponse);
+
+  // Client Streaming: Collect multiple messages, return concatenated result
+  // Client sends N messages, server responds with all messages joined with "|"
+  rpc Collect(stream CollectRequest) returns (CollectResponse);
+
+  // Server Streaming: Expand a single request into multiple responses
+  // Request contains a count N, server sends N responses numbered 0 to N-1
+  rpc Expand(ExpandRequest) returns (stream ExpandResponse);
+
+  // Bidirectional: Echo each message back immediately with sequence number
+  // Each client message gets an immediate response with "N:message" format
+  rpc BiEcho(stream BiEchoRequest) returns (stream BiEchoResponse);
+}
+
+// Unary messages
+message EchoRequest {
+  bytes data = 1;
+}
+
+message EchoResponse {
+  bytes data = 1;
+}
+
+// Client streaming messages
+message CollectRequest {
+  bytes data = 1;
+}
+
+message CollectResponse {
+  bytes data = 1;   // All received data joined with "|"
+  int32 count = 2;  // Number of messages received
+}
+
+// Server streaming messages
+message ExpandRequest {
+  int32 count = 1;   // Number of responses to generate
+  bytes prefix = 2;  // Prefix for each response
+}
+
+message ExpandResponse {
+  bytes data = 1;     // prefix + ":" + sequence_number
+  int32 sequence = 2;
+}
+
+// Bidirectional streaming messages
+message BiEchoRequest {
+  bytes data = 1;
+}
+
+message BiEchoResponse {
+  bytes data = 1;     // "N:original_data" where N is 0-indexed sequence
+  int32 sequence = 2;
+}
