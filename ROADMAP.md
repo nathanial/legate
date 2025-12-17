@@ -32,7 +32,7 @@ The items below are the most important missing pieces for “typical” gRPC usa
 
 - ~~**Deadline-exceeded on streaming RPCs:** not tested for client-stream/server-stream/bidi~~ ✅ **DONE** - Tested for all streaming RPC shapes
 - ~~**Mid-stream cancellation:** not tested (cancel during active streaming and verify termination semantics)~~ ✅ **DONE** - Tested for all streaming RPC shapes
-- **Server-side observation:** not tested that handlers reliably see `isCancelled` and stop work promptly
+- ~~**Server-side observation:** not tested that handlers reliably see `isCancelled` and stop work promptly~~ ✅ **DONE** - Tested via Go client `TestUnaryCancel` against Lean server (uses `isCancelled` polling)
 
 ### Status / Errors
 
