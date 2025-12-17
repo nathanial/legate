@@ -10,6 +10,15 @@ NC='\033[0m' # No Color
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
+# On macOS, Lake/Lean-built dylibs may depend on libLake_shared.dylib via @rpath.
+# Ensure the Lean toolchain lib directory is discoverable when running test executables.
+if [[ "$(uname -s)" == "Darwin" ]]; then
+    LEAN_PREFIX="$(lean --print-prefix 2>/dev/null | tr -d '\r\n' || true)"
+    if [[ -n "$LEAN_PREFIX" ]]; then
+        export DYLD_LIBRARY_PATH="$LEAN_PREFIX/lib/lean${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}"
+    fi
+fi
+
 echo "========================================"
 echo "Legate Test Suite"
 echo "========================================"

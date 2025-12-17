@@ -117,11 +117,13 @@ struct RegisteredHandler {
 struct ServerBuilderWrapper {
     std::unique_ptr<grpc::ServerBuilder> builder;
     std::vector<RegisteredHandler> handlers;
-    grpc::AsyncGenericService service;
+    std::unique_ptr<grpc::AsyncGenericService> service;
     int selected_port = 0;
 
-    ServerBuilderWrapper() : builder(std::make_unique<grpc::ServerBuilder>()) {
-        builder->RegisterAsyncGenericService(&service);
+    ServerBuilderWrapper()
+        : builder(std::make_unique<grpc::ServerBuilder>())
+        , service(std::make_unique<grpc::AsyncGenericService>()) {
+        builder->RegisterAsyncGenericService(service.get());
     }
 };
 
@@ -132,7 +134,7 @@ struct ServerWrapper {
     std::unique_ptr<grpc::Server> server;
     std::unique_ptr<grpc::ServerCompletionQueue> cq;
     std::vector<RegisteredHandler> handlers;
-    grpc::AsyncGenericService* service = nullptr;  // Borrowed from builder
+    std::unique_ptr<grpc::AsyncGenericService> service;
     std::thread polling_thread;
     std::atomic<bool> running{false};
 
@@ -605,6 +607,19 @@ extern "C" LEAN_EXPORT lean_obj_res legate_client_stream_finish(
         // Lean tuple (A × B × C) is (A × (B × C)), so nest the pairs
         lean_object* inner = mk_pair(trailers, status);
         lean_object* result = mk_pair(response, inner);
+        // Validate we constructed a proper nested tuple; if not, return a structured GrpcError
+        // rather than letting the Lean side segfault when it tries to deconstruct it.
+        if (inner == nullptr || result == nullptr || trailers == nullptr || response == nullptr || status == nullptr) {
+            grpc::Status err(grpc::StatusCode::INTERNAL,
+                             "legate_client_stream_finish: constructed null Lean object");
+            return mk_io_result_ok(mk_except_error(err));
+        }
+        if (lean_ctor_get(inner, 0) == nullptr || lean_ctor_get(inner, 1) == nullptr) {
+            grpc::Status err(grpc::StatusCode::INTERNAL,
+                             "legate_client_stream_finish: constructed invalid (trailers, status) tuple");
+            return mk_io_result_ok(mk_except_error(err));
+        }
+
         return mk_io_result_ok(mk_except_ok(result));
     } else {
         return mk_io_result_ok(mk_except_error(wrapper->status));
@@ -922,8 +937,8 @@ static void process_unary_call(ServerCallContext* call_ctx) {
     lean_object* h2 = lean_apply_1(h1, metadata);
     // Apply request bytes
     lean_object* h3 = lean_apply_1(h2, request_bytes);
-    // Execute the IO action
-    lean_object* io_result = lean_io_result_mk_ok(lean_apply_1(h3, lean_io_mk_world()));
+    // Execute the IO action by applying the world token; this returns an `IO.Result` directly.
+    lean_object* io_result = lean_apply_1(h3, lean_io_mk_world());
 
     // Check if IO succeeded
     if (lean_io_result_is_error(io_result)) {
@@ -1092,8 +1107,13 @@ extern "C" LEAN_EXPORT lean_obj_res legate_server_builder_build(
 
     auto* s_wrapper = new ServerWrapper();
 
-    // Store service reference for RequestCall
-    s_wrapper->service = &b_wrapper->service;
+    // Transfer service ownership to the server wrapper so it outlives the builder.
+    // The service must remain alive as long as the server is running.
+    s_wrapper->service = std::move(b_wrapper->service);
+    if (!s_wrapper->service) {
+        delete s_wrapper;
+        return mk_io_error("Failed to build server: missing AsyncGenericService");
+    }
 
     // Add completion queue
     s_wrapper->cq = b_wrapper->builder->AddCompletionQueue();
