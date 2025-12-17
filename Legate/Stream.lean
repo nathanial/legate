@@ -168,6 +168,10 @@ def read (stream : BidiStream) : IO (GrpcResult (Option ByteArray)) :=
 def getStatus (stream : BidiStream) : IO Status :=
   Internal.bidiStreamGetStatus stream.handle
 
+/-- Get trailing metadata (available after stream ends) -/
+def getTrailers (stream : BidiStream) : IO Metadata :=
+  Internal.bidiStreamGetTrailers stream.handle
+
 /-- Write multiple messages to the stream -/
 def writeAll (stream : BidiStream) (messages : Array ByteArray) : IO (GrpcResult Unit) := do
   for msg in messages do

@@ -22,6 +22,46 @@ def biEchoMethod := "/legate.test.TestService/BiEcho"
 -- Test configuration
 def serverAddr := "localhost:50051"
 
+/-- Test unary Echo RPC with metadata + trailing metadata -/
+def testUnaryMetadata : IO TestResult := do
+  let channel ← Channel.createInsecure serverAddr
+
+  let request : EchoRequest := { data := "hello".toUTF8 }
+  let requestBytes := Protolean.encodeMessage request
+
+  let opts := (CallOptions.default).withMetadata #[("x-legate-test", "lean")]
+  match ← unaryCall channel echoMethod requestBytes opts with
+  | .ok response =>
+    match response.trailers.get? "x-legate-test" with
+    | some v =>
+      if v == "lean" then
+        return .passed
+      else
+        return .failed s!"Expected trailer x-legate-test=lean, got {v}"
+    | none =>
+      return .failed "Missing trailer x-legate-test"
+  | .error e =>
+    return .failed s!"RPC error: {e}"
+
+/-- Test unary deadlines -/
+def testUnaryDeadlineExceeded : IO TestResult := do
+  let channel ← Channel.createInsecure serverAddr
+
+  let request : EchoRequest := { data := "hello".toUTF8 }
+  let requestBytes := Protolean.encodeMessage request
+
+  let opts :=
+    (CallOptions.default.withTimeout 50).withMetadata #[("x-sleep-ms", "200")]
+
+  match ← unaryCall channel echoMethod requestBytes opts with
+  | .ok _ =>
+    return .failed "Expected deadlineExceeded, got ok"
+  | .error e =>
+    if e.code == .deadlineExceeded then
+      return .passed
+    else
+      return .failed s!"Expected deadlineExceeded, got {e.code}: {e.message}"
+
 /-- Test unary Echo RPC -/
 def testUnaryEcho : IO TestResult := do
   let channel ← Channel.createInsecure serverAddr
@@ -49,8 +89,9 @@ def testUnaryEcho : IO TestResult := do
 /-- Test client streaming Collect RPC -/
 def testClientStreamingCollect : IO TestResult := do
   let channel ← Channel.createInsecure serverAddr
+  let opts := (CallOptions.default).withMetadata #[("x-legate-test", "lean")]
 
-  match ← clientStreamingCall channel collectMethod with
+  match ← clientStreamingCall channel collectMethod opts with
   | .ok stream =>
     -- Send multiple messages
     let messages := #["a", "b", "c"]
@@ -71,7 +112,9 @@ def testClientStreamingCollect : IO TestResult := do
       | .ok decoded =>
         let expectedData := "a|b|c".toUTF8
         if decoded.data == expectedData && decoded.count == 3 then
-          return .passed
+          match response.trailers.get? "x-legate-test" with
+          | some v => if v == "lean" then return .passed else return .failed s!"Expected trailer x-legate-test=lean, got {v}"
+          | none => return .failed "Missing trailer x-legate-test"
         else
           return .failed s!"Unexpected response: data='{String.fromUTF8! decoded.data}', count={decoded.count}"
       | .error e =>
@@ -84,12 +127,13 @@ def testClientStreamingCollect : IO TestResult := do
 /-- Test server streaming Expand RPC -/
 def testServerStreamingExpand : IO TestResult := do
   let channel ← Channel.createInsecure serverAddr
+  let opts := (CallOptions.default).withMetadata #[("x-legate-test", "lean")]
 
   -- Create and encode request (note: prefix_ because prefix is a Lean keyword)
   let request : ExpandRequest := { count := 3, prefix_ := "test".toUTF8 }
   let requestBytes := Protolean.encodeMessage request
 
-  match ← serverStreamingCall channel expandMethod requestBytes with
+  match ← serverStreamingCall channel expandMethod requestBytes opts with
   | .ok stream =>
     -- Read all responses into an array using a loop
     let mut resps : Array ExpandResponse := #[]
@@ -111,15 +155,19 @@ def testServerStreamingExpand : IO TestResult := do
       let expectedData := s!"test:{i}".toUTF8
       if resp.data != expectedData || resp.sequence != i.toInt32 then
         return .failed s!"Response {i} mismatch: got data='{String.fromUTF8! resp.data}', seq={resp.sequence}"
-    return .passed
+    let trailers ← stream.getTrailers
+    match trailers.get? "x-legate-test" with
+    | some v => if v == "lean" then return .passed else return .failed s!"Expected trailer x-legate-test=lean, got {v}"
+    | none => return .failed "Missing trailer x-legate-test"
   | .error e =>
     return .failed s!"Start stream error: {e}"
 
 /-- Test bidirectional streaming BiEcho RPC -/
 def testBidiStreaming : IO TestResult := do
   let channel ← Channel.createInsecure serverAddr
+  let opts := (CallOptions.default).withMetadata #[("x-legate-test", "lean")]
 
-  match ← bidiStreamingCall channel biEchoMethod with
+  match ← bidiStreamingCall channel biEchoMethod opts with
   | .ok stream =>
     -- Send messages and read responses
     let messages := #["x", "y", "z"]
@@ -145,6 +193,19 @@ def testBidiStreaming : IO TestResult := do
     | .ok () => pure ()
     | .error e => return .failed s!"WritesDone error: {e}"
 
+    -- Drain any remaining messages until stream end, then check trailers.
+    match ← stream.readAll with
+    | .ok _ => pure ()
+    | .error e => return .failed s!"ReadAll error: {e}"
+
+    let trailers ← stream.getTrailers
+    match trailers.get? "x-legate-test" with
+    | some v =>
+      if v != "lean" then
+        return .failed s!"Expected trailer x-legate-test=lean, got {v}"
+    | none =>
+      return .failed "Missing trailer x-legate-test"
+
     -- Verify responses
     for h : i in [:responses.size] do
       let resp := responses[i]
@@ -159,6 +220,8 @@ def testBidiStreaming : IO TestResult := do
 /-- Client test suite -/
 def clientTestSuite : TestSuite := suite "Lean Client -> Go Server" #[
   test "Unary Echo" testUnaryEcho,
+  test "Unary Metadata" testUnaryMetadata,
+  test "Unary Deadline" testUnaryDeadlineExceeded,
   test "Client Streaming Collect" testClientStreamingCollect,
   test "Server Streaming Expand" testServerStreamingExpand,
   test "Bidirectional BiEcho" testBidiStreaming

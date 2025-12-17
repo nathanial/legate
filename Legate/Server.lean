@@ -10,15 +10,33 @@ import Legate.Internal.FFI
 
 namespace Legate
 
+/-- Handle to an in-flight server call (deadline/cancellation). -/
+structure ServerCall where
+  private mk ::
+  private handle : Internal.ServerCall
+
+namespace ServerCall
+
+/-- Check whether the client has cancelled this call. -/
+def isCancelled (call : ServerCall) : IO Bool :=
+  Internal.serverCallIsCancelled call.handle
+
+/-- Remaining time until the call deadline (ms), or `none` if no deadline. -/
+def deadlineRemainingMs (call : ServerCall) : IO (Option UInt64) :=
+  Internal.serverCallDeadlineRemainingMs call.handle
+
+end ServerCall
+
 /-- Context for an incoming server call -/
 structure ServerContext where
   /-- The full method name being called -/
   method : String
   /-- Client metadata (headers) -/
   metadata : Metadata
+  /-- Call handle for deadline/cancellation queries -/
+  call : ServerCall
   /-- The peer address (if available) -/
   peer : String := ""
-  deriving Repr
 
 /-- A builder for configuring a gRPC server -/
 structure ServerBuilder where
@@ -102,8 +120,8 @@ def registerUnary
     (handler : UnaryHandler)
     : IO Unit := do
   -- Adapt user handler to FFI signature
-  let ffiHandler := fun (m : String) (md : Metadata) (req : ByteArray) => do
-    let ctx : ServerContext := { method := m, metadata := md }
+  let ffiHandler := fun (c : Internal.ServerCall) (m : String) (md : Metadata) (req : ByteArray) => do
+    let ctx : ServerContext := { method := m, metadata := md, call := ⟨c⟩ }
     handler ctx req
   Internal.serverRegisterUnary builder.handle method ffiHandler
 
@@ -114,8 +132,8 @@ def registerClientStreaming
     (handler : ClientStreamingHandler)
     : IO Unit := do
   -- Adapt user handler to FFI signature
-  let ffiHandler := fun (m : String) (md : Metadata) (recv : IO (Option ByteArray)) => do
-    let ctx : ServerContext := { method := m, metadata := md }
+  let ffiHandler := fun (c : Internal.ServerCall) (m : String) (md : Metadata) (recv : IO (Option ByteArray)) => do
+    let ctx : ServerContext := { method := m, metadata := md, call := ⟨c⟩ }
     handler ctx recv
   Internal.serverRegisterClientStreaming builder.handle method ffiHandler
 
@@ -126,8 +144,8 @@ def registerServerStreaming
     (handler : ServerStreamingHandler)
     : IO Unit := do
   -- Adapt user handler to FFI signature
-  let ffiHandler := fun (m : String) (md : Metadata) (req : ByteArray) (send : ByteArray → IO Unit) => do
-    let ctx : ServerContext := { method := m, metadata := md }
+  let ffiHandler := fun (c : Internal.ServerCall) (m : String) (md : Metadata) (req : ByteArray) (send : ByteArray → IO Unit) => do
+    let ctx : ServerContext := { method := m, metadata := md, call := ⟨c⟩ }
     handler ctx req send
   Internal.serverRegisterServerStreaming builder.handle method ffiHandler
 
@@ -138,8 +156,8 @@ def registerBidiStreaming
     (handler : BidiStreamingHandler)
     : IO Unit := do
   -- Adapt user handler to FFI signature
-  let ffiHandler := fun (m : String) (md : Metadata) (recv : IO (Option ByteArray)) (send : ByteArray → IO Unit) => do
-    let ctx : ServerContext := { method := m, metadata := md }
+  let ffiHandler := fun (c : Internal.ServerCall) (m : String) (md : Metadata) (recv : IO (Option ByteArray)) (send : ByteArray → IO Unit) => do
+    let ctx : ServerContext := { method := m, metadata := md, call := ⟨c⟩ }
     handler ctx recv send
   Internal.serverRegisterBidiStreaming builder.handle method ffiHandler
 

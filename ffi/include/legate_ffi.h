@@ -137,6 +137,9 @@ LEAN_EXPORT lean_obj_res legate_bidi_stream_read(b_lean_obj_arg stream, lean_obj
 // Get status from bidi stream
 LEAN_EXPORT lean_obj_res legate_bidi_stream_get_status(b_lean_obj_arg stream, lean_obj_arg world);
 
+// Get trailing metadata from bidi stream
+LEAN_EXPORT lean_obj_res legate_bidi_stream_get_trailers(b_lean_obj_arg stream, lean_obj_arg world);
+
 // ============================================================================
 // Server operations
 // ============================================================================
@@ -177,6 +180,16 @@ LEAN_EXPORT lean_obj_res legate_server_shutdown(b_lean_obj_arg server, lean_obj_
 
 // Shutdown the server immediately
 LEAN_EXPORT lean_obj_res legate_server_shutdown_now(b_lean_obj_arg server, lean_obj_arg world);
+
+// ============================================================================
+// Server call context helpers (deadline/cancellation)
+// ============================================================================
+
+// Check whether the client has cancelled the call.
+LEAN_EXPORT lean_obj_res legate_server_call_is_cancelled(b_lean_obj_arg call, lean_obj_arg world);
+
+// Remaining time until deadline in milliseconds, or none if no deadline.
+LEAN_EXPORT lean_obj_res legate_server_call_deadline_remaining_ms(b_lean_obj_arg call, lean_obj_arg world);
 
 #ifdef __cplusplus
 }

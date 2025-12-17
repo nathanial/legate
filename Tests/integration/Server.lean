@@ -12,14 +12,42 @@ namespace Tests.integration.Server
 open Legate
 open Legate.Test
 
+/-- Echo incoming `x-legate-test` header back as trailing metadata. -/
+def testTrailers (ctx : ServerContext) : Metadata :=
+  match ctx.metadata.get? "x-legate-test" with
+  | some v => #[("x-legate-test", v)]
+  | none => #[]
+
+def maybeSleepFromMetadata (ctx : ServerContext) : IO Unit := do
+  match ctx.metadata.get? "x-sleep-ms" with
+  | some s =>
+    match s.toNat? with
+    | some ms =>
+      IO.sleep (UInt32.ofNat ms)
+    | none => pure ()
+  | none => pure ()
+
+def maybeWaitForCancel (ctx : ServerContext) : IO Bool := do
+  match ctx.metadata.get? "x-wait-cancel" with
+  | none => return false
+  | some _ =>
+    while !(← ctx.call.isCancelled) do
+      IO.sleep 10
+    return true
+
 /-- Echo handler: returns "ECHO:" + request data -/
-def handleEcho (_ctx : ServerContext) (requestBytes : ByteArray)
+def handleEcho (ctx : ServerContext) (requestBytes : ByteArray)
     : IO (GrpcResult (ByteArray × Metadata)) := do
+  if (← maybeWaitForCancel ctx) then
+    return .error (GrpcError.mk .cancelled "Cancelled" none)
+
+  maybeSleepFromMetadata ctx
+
   match Protolean.decodeMessage (α := EchoRequest) requestBytes with
   | .ok request =>
     let responseData := "ECHO:".toUTF8 ++ request.data
     let response : EchoResponse := { data := responseData }
-    return .ok (Protolean.encodeMessage response, #[])
+    return .ok (Protolean.encodeMessage response, testTrailers ctx)
   | .error e =>
     return .error (GrpcError.mk .invalidArgument s!"Decode error: {e}" none)
 
@@ -48,7 +76,7 @@ def handleCollect (_ctx : ServerContext) (recv : IO (Option ByteArray))
     else acc ++ "|".toUTF8 ++ part
 
   let response : CollectResponse := { data := joined, count := count }
-  return .ok (Protolean.encodeMessage response, #[])
+  return .ok (Protolean.encodeMessage response, testTrailers _ctx)
 
 /-- Expand handler: sends N numbered responses
     Note: Streaming handlers are not yet fully implemented in the FFI.
@@ -61,7 +89,7 @@ def handleExpand (_ctx : ServerContext) (requestBytes : ByteArray) (send : ByteA
       let data := s!"{String.fromUTF8! request.prefix_}:{i}".toUTF8
       let response : ExpandResponse := { data := data, sequence := i.toInt32 }
       send (Protolean.encodeMessage response)
-    return .ok #[]
+    return .ok (testTrailers _ctx)
   | .error e =>
     return .error (GrpcError.mk .invalidArgument s!"Decode error: {e}" none)
 
@@ -84,7 +112,7 @@ def handleBiEcho (_ctx : ServerContext) (recv : IO (Option ByteArray)) (send : B
       | .error _ => pure ()  -- Skip malformed
     | none => done := true
 
-  return .ok #[]
+  return .ok (testTrailers _ctx)
 
 /-- Start the Lean TestService server -/
 def runTestServer (port : Nat := 50051) : IO Unit := do

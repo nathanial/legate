@@ -3,6 +3,7 @@
 #include <grpcpp/grpcpp.h>
 #include <grpcpp/generic/generic_stub.h>
 #include <grpcpp/generic/async_generic_service.h>
+#include <grpcpp/impl/client_unary_call.h>
 #include <grpc/byte_buffer_reader.h>
 
 #include <memory>
@@ -28,6 +29,7 @@ static lean_external_class* g_bidi_stream_class = nullptr;
 static lean_external_class* g_server_builder_class = nullptr;
 static lean_external_class* g_server_class = nullptr;
 static lean_external_class* g_server_io_state_class = nullptr;
+static lean_external_class* g_server_call_class = nullptr;
 
 static std::mutex g_init_mutex;
 static std::atomic<bool> g_initialized{false};
@@ -68,6 +70,7 @@ struct ClientStreamWrapper : StreamWrapperBase {
 struct ServerStreamWrapper : StreamWrapperBase {
     std::unique_ptr<grpc::GenericClientAsyncReaderWriter> stream;
     grpc::CompletionQueue cq;
+    bool read_finished = false;
     bool finished = false;
 };
 
@@ -77,6 +80,7 @@ struct BidiStreamWrapper : StreamWrapperBase {
     grpc::CompletionQueue cq;
     bool writes_done = false;
     bool read_finished = false;
+    bool finished = false;
 };
 
 // Forward declaration for call context (needed for server-side streaming callbacks).
@@ -88,6 +92,11 @@ struct ServerIOState {
     bool read_finished = false;
 
     explicit ServerIOState(ServerCallContext* c) : call_ctx(c) {}
+};
+
+struct ServerCallWrapper {
+    grpc::GenericServerContext* ctx = nullptr;  // non-owning
+    explicit ServerCallWrapper(grpc::GenericServerContext* c) : ctx(c) {}
 };
 
 // Server-side types
@@ -179,8 +188,11 @@ struct ServerCallContext {
     ServerWrapper* server;
     RegisteredHandler* handler;
     std::string method;
+    int tag_read = 0;
+    int tag_write = 0;
+    int tag_finish = 0;
 
-    ServerCallContext(ServerWrapper* s)
+    explicit ServerCallContext(ServerWrapper* s)
         : stream(&ctx), server(s), handler(nullptr) {}
 };
 
@@ -218,6 +230,10 @@ static void server_io_state_finalizer(void* ptr) {
     delete static_cast<ServerIOState*>(ptr);
 }
 
+static void server_call_finalizer(void* ptr) {
+    delete static_cast<ServerCallWrapper*>(ptr);
+}
+
 static void noop_foreach(void*, b_lean_obj_arg) {}
 
 // ============================================================================
@@ -233,6 +249,7 @@ static void init_external_classes() {
         g_server_builder_class = lean_register_external_class(server_builder_finalizer, noop_foreach);
         g_server_class = lean_register_external_class(server_finalizer, noop_foreach);
         g_server_io_state_class = lean_register_external_class(server_io_state_finalizer, noop_foreach);
+        g_server_call_class = lean_register_external_class(server_call_finalizer, noop_foreach);
     }
 }
 
@@ -313,23 +330,27 @@ static lean_object* mk_except_ok(lean_object* val) {
     return result;
 }
 
-// Create Except.error with GrpcError
-// GrpcError : StatusCode × String × Option ByteArray
+// Note: Lean may pack scalars (like StatusCode) into the scalar part of a
+// constructor object. We must mirror the actual generated layout instead of
+// assuming every field is a pointer slot.
+
 static lean_object* mk_except_error(const grpc::Status& status) {
-    // StatusCode is a simple enum (UInt8-like after boxing)
-    lean_object* code = lean_box(static_cast<unsigned>(status.error_code()));
+    // GrpcError layout (from generated C):
+    //   ctor tag 0, 2 pointer fields: (message, details), 1 scalar (uint8): code.
+    uint8_t code = static_cast<uint8_t>(status.error_code());
 
     // Error message
-    lean_object* msg = lean_mk_string(status.error_message().c_str());
+    std::string msg_s = status.error_message();
+    lean_object* msg = lean_mk_string(msg_s.c_str());
 
     // Details (Option ByteArray) - for now, always none
     lean_object* details = lean_box(0);  // Option.none
 
     // Create GrpcError structure
-    lean_object* grpc_error = lean_alloc_ctor(0, 3, 0);
-    lean_ctor_set(grpc_error, 0, code);
-    lean_ctor_set(grpc_error, 1, msg);
-    lean_ctor_set(grpc_error, 2, details);
+    lean_object* grpc_error = lean_alloc_ctor(0, 2, 1);
+    lean_ctor_set(grpc_error, 0, msg);
+    lean_ctor_set(grpc_error, 1, details);
+    lean_ctor_set_uint8(grpc_error, sizeof(void*) * 2, code);
 
     // Wrap in Except.error
     lean_object* result = lean_alloc_ctor(0, 1, 0);  // Except.error constructor
@@ -354,6 +375,43 @@ static bool debug_server_io_enabled() {
     return v && v[0] != '\0' && v[0] != '0';
 }
 
+static bool cq_wait_for_tag(grpc::CompletionQueue& cq, void* expected_tag, bool* ok_out);
+
+extern "C" LEAN_EXPORT lean_obj_res legate_server_call_is_cancelled(
+    b_lean_obj_arg call,
+    lean_obj_arg /* world */
+) {
+    auto* wrapper = static_cast<ServerCallWrapper*>(lean_get_external_data(call));
+    bool cancelled = false;
+    if (wrapper && wrapper->ctx) {
+        cancelled = wrapper->ctx->IsCancelled();
+    }
+    return mk_io_result_ok(lean_box(cancelled ? 1 : 0));
+}
+
+extern "C" LEAN_EXPORT lean_obj_res legate_server_call_deadline_remaining_ms(
+    b_lean_obj_arg call,
+    lean_obj_arg /* world */
+) {
+    auto* wrapper = static_cast<ServerCallWrapper*>(lean_get_external_data(call));
+    if (!wrapper || !wrapper->ctx) {
+        return mk_io_result_ok(mk_option_none());
+    }
+
+    auto deadline = wrapper->ctx->deadline();
+    if (deadline == std::chrono::system_clock::time_point::max()) {
+        return mk_io_result_ok(mk_option_none());
+    }
+
+    auto now = std::chrono::system_clock::now();
+    auto diff = deadline - now;
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(diff).count();
+    if (ms < 0) ms = 0;
+
+    lean_object* boxed = lean_box_uint64(static_cast<uint64_t>(ms));
+    return mk_io_result_ok(mk_option_some(boxed));
+}
+
 // IO callback: recv next message (IO (Option ByteArray))
 static lean_obj_res legate_server_recv_impl(lean_obj_arg state_obj, lean_obj_arg /* world */) {
     auto* state = static_cast<ServerIOState*>(lean_get_external_data(state_obj));
@@ -367,12 +425,12 @@ static lean_obj_res legate_server_recv_impl(lean_obj_arg state_obj, lean_obj_arg
         std::fprintf(stderr, "[legate] server recv: Read\n");
         std::fflush(stderr);
     }
-    state->call_ctx->stream.Read(&msg, reinterpret_cast<void*>(1));
-    void* tag = nullptr;
+    void* expected = &state->call_ctx->tag_read;
+    state->call_ctx->stream.Read(&msg, expected);
     bool ok = false;
-    state->call_ctx->call_cq.Next(&tag, &ok);
+    cq_wait_for_tag(state->call_ctx->call_cq, expected, &ok);
     if (debug_server_io_enabled()) {
-        std::fprintf(stderr, "[legate] server recv: Read done ok=%d tag=%p\n", ok ? 1 : 0, tag);
+        std::fprintf(stderr, "[legate] server recv: Read done ok=%d tag=%p\n", ok ? 1 : 0, expected);
         std::fflush(stderr);
     }
     if (!ok) {
@@ -400,12 +458,12 @@ static lean_obj_res legate_server_send_impl(
         std::fprintf(stderr, "[legate] server send: Write\n");
         std::fflush(stderr);
     }
-    state->call_ctx->stream.Write(buf, reinterpret_cast<void*>(2));
-    void* tag = nullptr;
+    void* expected = &state->call_ctx->tag_write;
+    state->call_ctx->stream.Write(buf, expected);
     bool ok = false;
-    state->call_ctx->call_cq.Next(&tag, &ok);
+    cq_wait_for_tag(state->call_ctx->call_cq, expected, &ok);
     if (debug_server_io_enabled()) {
-        std::fprintf(stderr, "[legate] server send: Write done ok=%d tag=%p\n", ok ? 1 : 0, tag);
+        std::fprintf(stderr, "[legate] server send: Write done ok=%d tag=%p\n", ok ? 1 : 0, expected);
         std::fflush(stderr);
     }
     return mk_io_result_ok(lean_box(0));
@@ -471,11 +529,14 @@ static void apply_trailing_metadata(grpc::ServerContext* ctx, b_lean_obj_arg met
 
 // Create Lean Status structure
 static lean_object* mk_status(const grpc::Status& status) {
-    lean_object* code = lean_box(static_cast<unsigned>(status.error_code()));
-    lean_object* msg = lean_mk_string(status.error_message().c_str());
-    lean_object* s = lean_alloc_ctor(0, 2, 0);
-    lean_ctor_set(s, 0, code);
-    lean_ctor_set(s, 1, msg);
+    // Status layout (from generated C):
+    //   ctor tag 0, 1 pointer field: (message), 1 scalar (uint8): code.
+    uint8_t code = static_cast<uint8_t>(status.error_code());
+    std::string msg_s = status.error_message();
+    lean_object* msg = lean_mk_string(msg_s.c_str());
+    lean_object* s = lean_alloc_ctor(0, 1, 1);
+    lean_ctor_set(s, 0, msg);
+    lean_ctor_set_uint8(s, sizeof(void*) * 1, code);
     return s;
 }
 
@@ -566,16 +627,15 @@ extern "C" LEAN_EXPORT lean_obj_res legate_unary_call(
     grpc::ByteBuffer request_buf = lean_bytearray_to_bytebuffer(request);
     grpc::ByteBuffer response_buf;
 
-    // Use async unary call with completion queue for synchronous behavior
-    grpc::CompletionQueue cq;
-    grpc::Status status;
-    auto reader = wrapper->stub->PrepareUnaryCall(&context, method_str, request_buf, &cq);
-    reader->StartCall();
-    reader->Finish(&response_buf, &status, reinterpret_cast<void*>(1));
-
-    void* tag;
-    bool ok;
-    cq.Next(&tag, &ok);
+    grpc::Status status = grpc::internal::BlockingUnaryCall(
+        wrapper->channel.get(),
+        grpc::internal::RpcMethod(
+            method_str.c_str(),
+            /*suffix_for_stats=*/nullptr,
+            grpc::internal::RpcMethod::NORMAL_RPC),
+        &context,
+        request_buf,
+        &response_buf);
 
     if (status.ok()) {
         lean_object* response = bytebuffer_to_lean_bytearray(response_buf);
@@ -778,7 +838,7 @@ extern "C" LEAN_EXPORT lean_obj_res legate_server_stream_read(
 ) {
     auto* wrapper = static_cast<ServerStreamWrapper*>(lean_get_external_data(stream));
 
-    if (wrapper->finished) {
+    if (wrapper->read_finished) {
         return mk_io_result_ok(mk_except_ok(mk_option_none()));
     }
 
@@ -791,7 +851,7 @@ extern "C" LEAN_EXPORT lean_obj_res legate_server_stream_read(
 
     if (!ok) {
         // Stream ended
-        wrapper->finished = true;
+        wrapper->read_finished = true;
         return mk_io_result_ok(mk_except_ok(mk_option_none()));
     }
 
@@ -804,6 +864,13 @@ extern "C" LEAN_EXPORT lean_obj_res legate_server_stream_get_trailers(
     lean_obj_arg /* world */
 ) {
     auto* wrapper = static_cast<ServerStreamWrapper*>(lean_get_external_data(stream));
+    if (!wrapper->finished) {
+        wrapper->stream->Finish(&wrapper->status, reinterpret_cast<void*>(5));
+        void* tag;
+        bool ok;
+        wrapper->cq.Next(&tag, &ok);
+        wrapper->finished = true;
+    }
     lean_object* trailers = trailing_metadata_to_lean(
         wrapper->context->GetServerTrailingMetadata());
     return mk_io_result_ok(trailers);
@@ -816,7 +883,6 @@ extern "C" LEAN_EXPORT lean_obj_res legate_server_stream_get_status(
     auto* wrapper = static_cast<ServerStreamWrapper*>(lean_get_external_data(stream));
 
     if (!wrapper->finished) {
-        // Need to finish first
         wrapper->stream->Finish(&wrapper->status, reinterpret_cast<void*>(5));
         void* tag;
         bool ok;
@@ -945,12 +1011,35 @@ extern "C" LEAN_EXPORT lean_obj_res legate_bidi_stream_get_status(
         legate_bidi_stream_writes_done(stream, lean_box(0));
     }
 
-    wrapper->stream->Finish(&wrapper->status, reinterpret_cast<void*>(5));
-    void* tag;
-    bool ok;
-    wrapper->cq.Next(&tag, &ok);
+    if (!wrapper->finished) {
+        wrapper->stream->Finish(&wrapper->status, reinterpret_cast<void*>(5));
+        void* tag;
+        bool ok;
+        wrapper->cq.Next(&tag, &ok);
+        wrapper->finished = true;
+    }
 
     return mk_io_result_ok(mk_status(wrapper->status));
+}
+
+extern "C" LEAN_EXPORT lean_obj_res legate_bidi_stream_get_trailers(
+    b_lean_obj_arg stream,
+    lean_obj_arg /* world */
+) {
+    auto* wrapper = static_cast<BidiStreamWrapper*>(lean_get_external_data(stream));
+    if (!wrapper->writes_done) {
+        legate_bidi_stream_writes_done(stream, lean_box(0));
+    }
+    if (!wrapper->finished) {
+        wrapper->stream->Finish(&wrapper->status, reinterpret_cast<void*>(5));
+        void* tag;
+        bool ok;
+        wrapper->cq.Next(&tag, &ok);
+        wrapper->finished = true;
+    }
+    lean_object* trailers = trailing_metadata_to_lean(
+        wrapper->context->GetServerTrailingMetadata());
+    return mk_io_result_ok(trailers);
 }
 
 // ============================================================================
@@ -991,9 +1080,10 @@ static bool extract_except_result(
     } else {
         // Except.error - extract GrpcError
         lean_object* grpc_error = lean_ctor_get(except_result, 0);
-        lean_object* code_obj = lean_ctor_get(grpc_error, 0);
-        lean_object* msg_obj = lean_ctor_get(grpc_error, 1);
-        *error_code = lean_unbox(code_obj);
+        // GrpcError is packed: msg at idx 0, code stored as uint8 after pointers.
+        uint8_t code = lean_ctor_get_uint8(grpc_error, sizeof(void*) * 2);
+        lean_object* msg_obj = lean_ctor_get(grpc_error, 0);
+        *error_code = static_cast<int>(code);
         *error_msg = lean_string_cstr(msg_obj);
         return false;
     }
@@ -1005,29 +1095,48 @@ static grpc::Status grpc_status_from_lean_error(int error_code, const std::strin
     return grpc::Status(static_cast<grpc::StatusCode>(error_code), error_msg);
 }
 
-static bool cq_next(grpc::CompletionQueue& cq, bool* ok_out) {
-    void* tag;
-    bool ok = false;
-    bool alive = cq.Next(&tag, &ok);
-    if (ok_out) *ok_out = ok;
-    return alive;
+static bool cq_wait_for_tag(grpc::CompletionQueue& cq, void* expected_tag, bool* ok_out) {
+    while (true) {
+        void* tag = nullptr;
+        bool ok = false;
+        bool alive = cq.Next(&tag, &ok);
+        if (!alive) {
+            if (ok_out) *ok_out = false;
+            return false;
+        }
+        if (tag == expected_tag) {
+            if (ok_out) *ok_out = ok;
+            return true;
+        }
+        // Unexpected event: drain it and keep waiting. With our server design,
+        // this usually means a leftover event from a previous call.
+        if (debug_server_io_enabled()) {
+            std::fprintf(stderr, "[legate] server cq: unexpected tag=%p expected=%p ok=%d\n", tag, expected_tag, ok ? 1 : 0);
+            std::fflush(stderr);
+        }
+    }
 }
 
 static bool server_read_one(ServerCallContext* call_ctx, grpc::ByteBuffer* out) {
-    call_ctx->stream.Read(out, reinterpret_cast<void*>(1));
+    void* expected = &call_ctx->tag_read;
+    call_ctx->stream.Read(out, expected);
     bool ok = false;
-    cq_next(call_ctx->call_cq, &ok);
+    cq_wait_for_tag(call_ctx->call_cq, expected, &ok);
     return ok;
 }
 
 static void server_finish(ServerCallContext* call_ctx, const grpc::Status& status) {
-    call_ctx->stream.Finish(status, reinterpret_cast<void*>(3));
+    void* expected = &call_ctx->tag_finish;
+    call_ctx->stream.Finish(status, expected);
     bool ok = false;
-    cq_next(call_ctx->call_cq, &ok);
-    // Drain and shutdown the per-call CQ.
+    cq_wait_for_tag(call_ctx->call_cq, expected, &ok);
+
+    // Shutdown and drain the per-call CQ before deleting the call context.
     call_ctx->call_cq.Shutdown();
     while (true) {
-        bool alive = cq_next(call_ctx->call_cq, nullptr);
+        void* tag = nullptr;
+        bool ok2 = false;
+        bool alive = call_ctx->call_cq.Next(&tag, &ok2);
         if (!alive) break;
     }
 }
@@ -1038,6 +1147,21 @@ static void handle_server_call(ServerCallContext* call_ctx) {
         server_finish(call_ctx, grpc::Status(grpc::StatusCode::UNIMPLEMENTED, "Method not implemented"));
         return;
     }
+
+    auto* call_wrapper = new ServerCallWrapper(&call_ctx->ctx);
+    lean_object* call_obj = lean_alloc_external(g_server_call_class, call_wrapper);
+    // Keep the external object alive even if the Lean handler doesn't use it.
+    // Otherwise the finalizer may delete call_wrapper early, and we'd write to
+    // freed memory when clearing wrapper->ctx at the end of this call.
+    lean_inc(call_obj);
+    struct CallObjPin {
+        ServerCallWrapper* wrapper;
+        lean_object* obj;
+        ~CallObjPin() {
+            if (wrapper) wrapper->ctx = nullptr;
+            if (obj) lean_dec(obj);
+        }
+    } call_pin{call_wrapper, call_obj};
 
     // Convert metadata to Lean array
     lean_object* metadata = server_metadata_to_lean(call_ctx->ctx.client_metadata());
@@ -1056,7 +1180,8 @@ static void handle_server_call(ServerCallContext* call_ctx) {
 
             lean_object* handler_obj = handler->handler;
             lean_inc(handler_obj);
-            lean_object* h1 = lean_apply_1(handler_obj, method_str);
+            lean_object* h0 = lean_apply_1(handler_obj, call_obj);
+            lean_object* h1 = lean_apply_1(h0, method_str);
             lean_object* h2 = lean_apply_1(h1, metadata);
             lean_object* h3 = lean_apply_1(h2, request_bytes);
             lean_object* io_result = lean_apply_1(h3, lean_io_mk_world());
@@ -1083,9 +1208,10 @@ static void handle_server_call(ServerCallContext* call_ctx) {
             apply_trailing_metadata(&call_ctx->ctx, trailers);
 
             grpc::ByteBuffer response = lean_bytearray_to_bytebuffer(response_bytes);
-            call_ctx->stream.Write(response, reinterpret_cast<void*>(2));
+            void* expected = &call_ctx->tag_write;
+            call_ctx->stream.Write(response, expected);
             bool ok = false;
-            cq_next(call_ctx->call_cq, &ok);
+            cq_wait_for_tag(call_ctx->call_cq, expected, &ok);
             lean_dec(ok_value);
             lean_dec(io_result);
 
@@ -1095,18 +1221,22 @@ static void handle_server_call(ServerCallContext* call_ctx) {
 
         case HandlerType::CLIENT_STREAMING: {
             auto* state = new ServerIOState(call_ctx);
-            struct CallCtxDisabler {
-                ServerIOState* state;
-                ~CallCtxDisabler() {
-                    if (state) state->call_ctx = nullptr;
-                }
-            } disabler{state};
             lean_object* state_obj = lean_alloc_external(g_server_io_state_class, state);
+            lean_inc(state_obj);
+            struct StateObjPin {
+                ServerIOState* state;
+                lean_object* obj;
+                ~StateObjPin() {
+                    if (state) state->call_ctx = nullptr;
+                    if (obj) lean_dec(obj);
+                }
+            } state_pin{state, state_obj};
             lean_object* recv_action = mk_server_recv_action(state_obj);
 
             lean_object* handler_obj = handler->handler;
             lean_inc(handler_obj);
-            lean_object* h1 = lean_apply_1(handler_obj, method_str);
+            lean_object* h0 = lean_apply_1(handler_obj, call_obj);
+            lean_object* h1 = lean_apply_1(h0, method_str);
             lean_object* h2 = lean_apply_1(h1, metadata);
             lean_object* h3 = lean_apply_1(h2, recv_action);
             lean_object* io_result = lean_apply_1(h3, lean_io_mk_world());
@@ -1133,9 +1263,10 @@ static void handle_server_call(ServerCallContext* call_ctx) {
             apply_trailing_metadata(&call_ctx->ctx, trailers);
 
             grpc::ByteBuffer response = lean_bytearray_to_bytebuffer(response_bytes);
-            call_ctx->stream.Write(response, reinterpret_cast<void*>(2));
+            void* expected = &call_ctx->tag_write;
+            call_ctx->stream.Write(response, expected);
             bool ok = false;
-            cq_next(call_ctx->call_cq, &ok);
+            cq_wait_for_tag(call_ctx->call_cq, expected, &ok);
             lean_dec(ok_value);
             lean_dec(io_result);
 
@@ -1153,18 +1284,22 @@ static void handle_server_call(ServerCallContext* call_ctx) {
             lean_object* request_bytes = bytebuffer_to_lean_bytearray(request);
 
             auto* state = new ServerIOState(call_ctx);
-            struct CallCtxDisabler {
-                ServerIOState* state;
-                ~CallCtxDisabler() {
-                    if (state) state->call_ctx = nullptr;
-                }
-            } disabler{state};
             lean_object* state_obj = lean_alloc_external(g_server_io_state_class, state);
+            lean_inc(state_obj);
+            struct StateObjPin {
+                ServerIOState* state;
+                lean_object* obj;
+                ~StateObjPin() {
+                    if (state) state->call_ctx = nullptr;
+                    if (obj) lean_dec(obj);
+                }
+            } state_pin{state, state_obj};
             lean_object* send_fn = mk_server_send_fn(state_obj);
 
             lean_object* handler_obj = handler->handler;
             lean_inc(handler_obj);
-            lean_object* h1 = lean_apply_1(handler_obj, method_str);
+            lean_object* h0 = lean_apply_1(handler_obj, call_obj);
+            lean_object* h1 = lean_apply_1(h0, method_str);
             lean_object* h2 = lean_apply_1(h1, metadata);
             lean_object* h3 = lean_apply_1(h2, request_bytes);
             lean_object* h4 = lean_apply_1(h3, send_fn);
@@ -1197,20 +1332,24 @@ static void handle_server_call(ServerCallContext* call_ctx) {
 
         case HandlerType::BIDI_STREAMING: {
             auto* state = new ServerIOState(call_ctx);
-            struct CallCtxDisabler {
-                ServerIOState* state;
-                ~CallCtxDisabler() {
-                    if (state) state->call_ctx = nullptr;
-                }
-            } disabler{state};
             lean_object* state_obj = lean_alloc_external(g_server_io_state_class, state);
+            lean_inc(state_obj);
+            struct StateObjPin {
+                ServerIOState* state;
+                lean_object* obj;
+                ~StateObjPin() {
+                    if (state) state->call_ctx = nullptr;
+                    if (obj) lean_dec(obj);
+                }
+            } state_pin{state, state_obj};
             lean_object* recv_action = mk_server_recv_action(state_obj);
             lean_inc(state_obj);
             lean_object* send_fn = mk_server_send_fn(state_obj);
 
             lean_object* handler_obj = handler->handler;
             lean_inc(handler_obj);
-            lean_object* h1 = lean_apply_1(handler_obj, method_str);
+            lean_object* h0 = lean_apply_1(handler_obj, call_obj);
+            lean_object* h1 = lean_apply_1(h0, method_str);
             lean_object* h2 = lean_apply_1(h1, metadata);
             lean_object* h3 = lean_apply_1(h2, recv_action);
             lean_object* h4 = lean_apply_1(h3, send_fn);
@@ -1472,9 +1611,7 @@ extern "C" LEAN_EXPORT lean_obj_res legate_server_shutdown(
     if (wrapper->server) {
         wrapper->server->Shutdown();
     }
-    if (wrapper->cq) {
-        wrapper->cq->Shutdown();
-    }
+    if (wrapper->cq) wrapper->cq->Shutdown();
     if (wrapper->polling_thread.joinable()) {
         wrapper->polling_thread.join();
     }

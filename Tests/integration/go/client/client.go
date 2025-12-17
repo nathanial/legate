@@ -9,7 +9,10 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 
 	pb "legate/tests/integration/go/pb"
 )
@@ -44,14 +47,34 @@ func (c *Client) Close() error {
 	return c.conn.Close()
 }
 
+func outgoingTestMetadata(ctx context.Context, value string) context.Context {
+	return metadata.NewOutgoingContext(ctx, metadata.Pairs("x-legate-test", value))
+}
+
+func verifyTrailerHasTestMetadata(trailers metadata.MD, value string) error {
+	vals := trailers.Get("x-legate-test")
+	if len(vals) == 0 {
+		return fmt.Errorf("missing trailing metadata x-legate-test")
+	}
+	if vals[0] != value {
+		return fmt.Errorf("unexpected trailing metadata x-legate-test: got %q want %q", vals[0], value)
+	}
+	return nil
+}
+
 // TestUnary tests the Echo RPC.
 func (c *Client) TestUnary(data []byte) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	resp, err := c.client.Echo(ctx, &pb.EchoRequest{Data: data})
+	var trailers metadata.MD
+	ctx = outgoingTestMetadata(ctx, "go")
+	resp, err := c.client.Echo(ctx, &pb.EchoRequest{Data: data}, grpc.Trailer(&trailers))
 	if err != nil {
 		return fmt.Errorf("Echo failed: %w", err)
+	}
+	if err := verifyTrailerHasTestMetadata(trailers, "go"); err != nil {
+		return err
 	}
 
 	expected := append([]byte("ECHO:"), data...)
@@ -68,6 +91,7 @@ func (c *Client) TestClientStream(data []byte, count int) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
+	ctx = outgoingTestMetadata(ctx, "go")
 	stream, err := c.client.Collect(ctx)
 	if err != nil {
 		return fmt.Errorf("Collect failed to start: %w", err)
@@ -86,6 +110,9 @@ func (c *Client) TestClientStream(data []byte, count int) error {
 	resp, err := stream.CloseAndRecv()
 	if err != nil {
 		return fmt.Errorf("Collect close failed: %w", err)
+	}
+	if err := verifyTrailerHasTestMetadata(stream.Trailer(), "go"); err != nil {
+		return err
 	}
 
 	if resp.Count != int32(count) {
@@ -106,6 +133,7 @@ func (c *Client) TestServerStream(prefix []byte, count int) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
+	ctx = outgoingTestMetadata(ctx, "go")
 	stream, err := c.client.Expand(ctx, &pb.ExpandRequest{
 		Count:  int32(count),
 		Prefix: prefix,
@@ -135,6 +163,9 @@ func (c *Client) TestServerStream(prefix []byte, count int) error {
 	if received != count {
 		return fmt.Errorf("unexpected message count: got %d, want %d", received, count)
 	}
+	if err := verifyTrailerHasTestMetadata(stream.Trailer(), "go"); err != nil {
+		return err
+	}
 
 	log.Printf("Server streaming test passed: received %d messages", received)
 	return nil
@@ -145,6 +176,7 @@ func (c *Client) TestBidi(data []byte, count int) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
+	ctx = outgoingTestMetadata(ctx, "go")
 	stream, err := c.client.BiEcho(ctx)
 	if err != nil {
 		return fmt.Errorf("BiEcho failed to start: %w", err)
@@ -180,7 +212,64 @@ func (c *Client) TestBidi(data []byte, count int) error {
 		return fmt.Errorf("unexpected extra response after CloseSend: %q", resp.Data)
 	}
 
+	if err := verifyTrailerHasTestMetadata(stream.Trailer(), "go"); err != nil {
+		return err
+	}
+
 	log.Printf("Bidirectional streaming test passed: exchanged %d messages", count)
+	return nil
+}
+
+// TestUnaryDeadlineExceeded verifies deadline propagation using x-sleep-ms.
+func (c *Client) TestUnaryDeadlineExceeded(data []byte) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	ctx = outgoingTestMetadata(ctx, "go")
+	ctx = metadata.AppendToOutgoingContext(ctx, "x-sleep-ms", "200")
+	_, err := c.client.Echo(ctx, &pb.EchoRequest{Data: data})
+	if err == nil {
+		return fmt.Errorf("expected deadline exceeded error, got nil")
+	}
+	st, ok := status.FromError(err)
+	if !ok {
+		return fmt.Errorf("expected grpc status error, got %T", err)
+	}
+	if st.Code() != codes.DeadlineExceeded {
+		return fmt.Errorf("expected DeadlineExceeded, got %s: %v", st.Code(), err)
+	}
+	return nil
+}
+
+// TestUnaryCancel verifies cancellation propagation using x-wait-cancel.
+func (c *Client) TestUnaryCancel(data []byte) error {
+	ctx, cancel := context.WithCancel(context.Background())
+	ctx, timeoutCancel := context.WithTimeout(ctx, 5*time.Second)
+	defer timeoutCancel()
+
+	ctx = outgoingTestMetadata(ctx, "go")
+	ctx = metadata.AppendToOutgoingContext(ctx, "x-wait-cancel", "1")
+
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := c.client.Echo(ctx, &pb.EchoRequest{Data: data})
+		errCh <- err
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+
+	err := <-errCh
+	if err == nil {
+		return fmt.Errorf("expected cancellation error, got nil")
+	}
+	st, ok := status.FromError(err)
+	if !ok {
+		return fmt.Errorf("expected grpc status error, got %T", err)
+	}
+	if st.Code() != codes.Canceled {
+		return fmt.Errorf("expected Canceled, got %s: %v", st.Code(), err)
+	}
 	return nil
 }
 
@@ -194,6 +283,8 @@ func (c *Client) TestAll(data []byte, count int) error {
 		{"client-stream", func() error { return c.TestClientStream(data, count) }},
 		{"server-stream", func() error { return c.TestServerStream(data, count) }},
 		{"bidi", func() error { return c.TestBidi(data, count) }},
+		{"deadline", func() error { return c.TestUnaryDeadlineExceeded(data) }},
+		{"cancel", func() error { return c.TestUnaryCancel(data) }},
 	}
 
 	for _, t := range tests {

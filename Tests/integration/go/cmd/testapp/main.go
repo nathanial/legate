@@ -23,7 +23,7 @@ func main() {
 
 	// Client flags
 	clientAddr := clientCmd.String("addr", "localhost:50051", "Server address")
-	clientTest := clientCmd.String("test", "all", "Test to run: unary|client-stream|server-stream|bidi|all")
+	clientTest := clientCmd.String("test", "all", "Test to run: unary|client-stream|server-stream|bidi|deadline|cancel|all")
 	clientData := clientCmd.String("data", "hello", "Test data payload")
 	clientCount := clientCmd.Int("count", 5, "Count for streaming tests")
 
@@ -63,7 +63,7 @@ func printUsage() {
 	fmt.Println()
 	fmt.Println("Client options:")
 	fmt.Println("  -addr string   Server address (default \"localhost:50051\")")
-	fmt.Println("  -test string   Test to run: unary|client-stream|server-stream|bidi|all (default \"all\")")
+	fmt.Println("  -test string   Test to run: unary|client-stream|server-stream|bidi|deadline|cancel|all (default \"all\")")
 	fmt.Println("  -data string   Test data payload (default \"hello\")")
 	fmt.Println("  -count int     Count for streaming tests (default 5)")
 	fmt.Println()
@@ -107,10 +107,14 @@ func runClient(addr, test, data string, count int) {
 		testErr = c.TestClientStream([]byte(data), count)
 	case "server-stream":
 		testErr = c.TestServerStream([]byte(data), count)
-	case "bidi":
-		testErr = c.TestBidi([]byte(data), count)
-	case "all":
-		testErr = c.TestAll([]byte(data), count)
+		case "bidi":
+			testErr = c.TestBidi([]byte(data), count)
+		case "deadline":
+			testErr = c.TestUnaryDeadlineExceeded([]byte(data))
+		case "cancel":
+			testErr = c.TestUnaryCancel([]byte(data))
+		case "all":
+			testErr = c.TestAll([]byte(data), count)
 	default:
 		log.Fatalf("Unknown test: %s", test)
 	}
