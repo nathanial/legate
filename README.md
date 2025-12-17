@@ -127,6 +127,8 @@ def streamingExample : IO Unit := do
 | `Metadata` | Key-value pairs for headers/trailers |
 | `CallOptions` | Timeout, metadata, wait-for-ready settings |
 
+`CallOptions.waitForReady` follows gRPC semantics: when `true`, the RPC will wait for the channel to become ready (up to the deadline); when `false`, calls to an unavailable server fail fast with `Unavailable`.
+
 ### Client Functions
 
 ```lean

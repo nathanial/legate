@@ -102,6 +102,7 @@ opaque unaryCall
     (request : @& ByteArray)
     (timeoutMs : UInt64)
     (metadata : @& Metadata)
+    (waitForReady : UInt8)
     : IO (Except GrpcError (ByteArray × Metadata × Metadata))
 
 -- ============================================================================
@@ -115,6 +116,7 @@ opaque clientStreamingCallStart
     (method : @& String)
     (timeoutMs : UInt64)
     (metadata : @& Metadata)
+    (waitForReady : UInt8)
     : IO (Except GrpcError ClientStream)
 
 /-- Write to a client stream -/
@@ -154,6 +156,7 @@ opaque serverStreamingCallStart
     (request : @& ByteArray)
     (timeoutMs : UInt64)
     (metadata : @& Metadata)
+    (waitForReady : UInt8)
     : IO (Except GrpcError ServerStream)
 
 /-- Read from a server stream -/
@@ -187,6 +190,7 @@ opaque bidiStreamingCallStart
     (method : @& String)
     (timeoutMs : UInt64)
     (metadata : @& Metadata)
+    (waitForReady : UInt8)
     : IO (Except GrpcError BidiStream)
 
 /-- Write to a bidi stream -/

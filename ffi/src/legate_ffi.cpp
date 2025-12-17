@@ -162,6 +162,13 @@ struct ServerBuilderWrapper {
         , service(std::make_unique<grpc::AsyncGenericService>()) {
         builder->RegisterAsyncGenericService(service.get());
     }
+
+    ~ServerBuilderWrapper() {
+        for (int fd : reserved_fds) {
+            if (fd != -1) ::close(fd);
+        }
+        reserved_fds.clear();
+    }
 };
 
 struct ServerWrapper {
@@ -781,6 +788,7 @@ extern "C" LEAN_EXPORT lean_obj_res legate_unary_call(
     b_lean_obj_arg request,
     uint64_t timeout_ms,
     b_lean_obj_arg metadata,
+    uint8_t wait_for_ready,
     lean_obj_arg /* world */
 ) {
     auto* wrapper = static_cast<ChannelWrapper*>(lean_get_external_data(channel));
@@ -789,6 +797,7 @@ extern "C" LEAN_EXPORT lean_obj_res legate_unary_call(
     grpc::ClientContext context;
     apply_timeout(&context, timeout_ms);
     apply_metadata(&context, metadata);
+    context.set_wait_for_ready(wait_for_ready != 0);
 
     grpc::ByteBuffer request_buf = lean_bytearray_to_bytebuffer(request);
     grpc::ByteBuffer response_buf;
@@ -826,6 +835,7 @@ extern "C" LEAN_EXPORT lean_obj_res legate_client_streaming_call_start(
     b_lean_obj_arg method,
     uint64_t timeout_ms,
     b_lean_obj_arg metadata,
+    uint8_t wait_for_ready,
     lean_obj_arg /* world */
 ) {
     auto* ch_wrapper = static_cast<ChannelWrapper*>(lean_get_external_data(channel));
@@ -834,6 +844,7 @@ extern "C" LEAN_EXPORT lean_obj_res legate_client_streaming_call_start(
     auto* wrapper = new ClientStreamWrapper();
     apply_timeout(wrapper->context.get(), timeout_ms);
     apply_metadata(wrapper->context.get(), metadata);
+    wrapper->context->set_wait_for_ready(wait_for_ready != 0);
 
     // Use PrepareCall which returns a bidirectional stream
     wrapper->stream = ch_wrapper->stub->PrepareCall(
@@ -982,6 +993,7 @@ extern "C" LEAN_EXPORT lean_obj_res legate_server_streaming_call_start(
     b_lean_obj_arg request,
     uint64_t timeout_ms,
     b_lean_obj_arg metadata,
+    uint8_t wait_for_ready,
     lean_obj_arg /* world */
 ) {
     auto* ch_wrapper = static_cast<ChannelWrapper*>(lean_get_external_data(channel));
@@ -990,6 +1002,7 @@ extern "C" LEAN_EXPORT lean_obj_res legate_server_streaming_call_start(
     auto* wrapper = new ServerStreamWrapper();
     apply_timeout(wrapper->context.get(), timeout_ms);
     apply_metadata(wrapper->context.get(), metadata);
+    wrapper->context->set_wait_for_ready(wait_for_ready != 0);
 
     grpc::ByteBuffer request_buf = lean_bytearray_to_bytebuffer(request);
 
@@ -1116,6 +1129,7 @@ extern "C" LEAN_EXPORT lean_obj_res legate_bidi_streaming_call_start(
     b_lean_obj_arg method,
     uint64_t timeout_ms,
     b_lean_obj_arg metadata,
+    uint8_t wait_for_ready,
     lean_obj_arg /* world */
 ) {
     auto* ch_wrapper = static_cast<ChannelWrapper*>(lean_get_external_data(channel));
@@ -1124,6 +1138,7 @@ extern "C" LEAN_EXPORT lean_obj_res legate_bidi_streaming_call_start(
     auto* wrapper = new BidiStreamWrapper();
     apply_timeout(wrapper->context.get(), timeout_ms);
     apply_metadata(wrapper->context.get(), metadata);
+    wrapper->context->set_wait_for_ready(wait_for_ready != 0);
 
     wrapper->stream = ch_wrapper->stub->PrepareCall(
         wrapper->context.get(), method_str, &wrapper->cq);

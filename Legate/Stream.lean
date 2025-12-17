@@ -76,7 +76,7 @@ def clientStreamingCall
     (options : CallOptions := {})
     : IO (GrpcResult ClientStreamWriter) := do
   let result ← Internal.clientStreamingCallStart
-    channel.toInternal method options.timeoutMs options.metadata
+    channel.toInternal method options.timeoutMs options.metadata (if options.waitForReady then 1 else 0)
   match result with
   | .ok handle => return .ok ⟨handle⟩
   | .error e => return .error e
@@ -155,7 +155,7 @@ def serverStreamingCall
     (options : CallOptions := {})
     : IO (GrpcResult ServerStreamReader) := do
   let result ← Internal.serverStreamingCallStart
-    channel.toInternal method request options.timeoutMs options.metadata
+    channel.toInternal method request options.timeoutMs options.metadata (if options.waitForReady then 1 else 0)
   match result with
   | .ok handle => return .ok ⟨handle⟩
   | .error e => return .error e
@@ -227,7 +227,7 @@ def bidiStreamingCall
     (options : CallOptions := {})
     : IO (GrpcResult BidiStream) := do
   let result ← Internal.bidiStreamingCallStart
-    channel.toInternal method options.timeoutMs options.metadata
+    channel.toInternal method options.timeoutMs options.metadata (if options.waitForReady then 1 else 0)
   match result with
   | .ok handle => return .ok ⟨handle⟩
   | .error e => return .error e

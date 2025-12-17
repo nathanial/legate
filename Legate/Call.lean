@@ -38,7 +38,7 @@ def unaryCall
     (options : CallOptions := {})
     : IO (GrpcResult UnaryResponse) := do
   let result ← Internal.unaryCall
-    channel.toInternal method request options.timeoutMs options.metadata
+    channel.toInternal method request options.timeoutMs options.metadata (if options.waitForReady then 1 else 0)
   match result with
   | .ok (data, headers, trailers) => return .ok { data, headers, trailers }
   | .error e => return .error e

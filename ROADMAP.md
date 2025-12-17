@@ -47,7 +47,7 @@ The items below are the most important missing pieces for “typical” gRPC usa
 
 ### Channel & Call Semantics
 
-- **`waitForReady`:** `CallOptions.waitForReady` exists but is not wired/tested end-to-end
+- ~~**`waitForReady`:** `CallOptions.waitForReady` exists but is not wired/tested end-to-end~~ ✅ **DONE** - Wired through gRPC core and tested
 - **Connectivity transitions:** no tests for `idle → ready → transientFailure` behaviors
 - **Name resolution / multiple addresses:** not tested
 
@@ -150,15 +150,15 @@ This is the suggested order to reach “common gRPC feature parity” for Lean.
 **Definition of done**
 - Lean client/server can do secure gRPC in the standard configurations.
 
-### Phase 5 — Wait-for-ready, Retries, and Resilience
+### Phase 5 — Wait-for-ready, Retries, and Resilience ✅ **COMPLETE**
 
 **Add APIs**
-- Wire `CallOptions.waitForReady` through to gRPC core (and document semantics)
+- ✅ Wire `CallOptions.waitForReady` through to gRPC core (and document semantics)
 - Consider service config / retry policies (if in scope)
 
 **Add tests**
-- Call made while server is down with `waitForReady=true`: succeeds when server comes up
-- Without wait-for-ready: fails fast
+- ✅ Call made while server is down with `waitForReady=true`: succeeds when server comes up
+- ✅ Without wait-for-ready: fails fast
 
 **Definition of done**
 - Lean supports the common “bring server up later” deployment use case.

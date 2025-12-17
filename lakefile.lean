@@ -80,7 +80,13 @@ lean_exe tests where
 -- Integration tests library - protobuf-based tests against Go server
 lean_lib IntegrationTests where
   srcDir := "."
-  roots := #[`Tests.integration.Proto, `Tests.integration.Client, `Tests.integration.Server, `Tests.integration.TlsTests]
+  roots := #[
+    `Tests.integration.Proto,
+    `Tests.integration.Client,
+    `Tests.integration.Server,
+    `Tests.integration.TlsTests,
+    `Tests.integration.WaitForReadyTests
+  ]
   moreLinkArgs := #["-L.lake/build/lib", "-lLegate", "-L.lake/packages/protolean/.lake/build/lib", "-lProtolean"] ++ ffiLinkArgs
 
 -- Integration test executable

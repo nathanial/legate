@@ -8,6 +8,7 @@ import Tests.Framework
 import Tests.integration.Client
 import Tests.integration.Server
 import Tests.integration.TlsTests
+import Tests.integration.WaitForReadyTests
 
 open Tests
 
@@ -37,21 +38,31 @@ def main (args : List String) : IO UInt32 := do
     IO.println ""
     runAllSuites #[Tests.integration.TlsTests.tlsTestSuite]
 
+  | "ready" =>
+    -- Run wait-for-ready tests (Lean client <-> Lean server)
+    IO.println "Lean Integration Tests (WaitForReady Mode)"
+    IO.println "==========================================="
+    IO.println "Testing CallOptions.waitForReady behavior..."
+    IO.println ""
+    runAllSuites #[Tests.integration.WaitForReadyTests.waitForReadyTestSuite]
+
   | "help" | "--help" | "-h" =>
-    IO.println "Usage: integrationTests [client|server|tls] [port]"
+    IO.println "Usage: integrationTests [client|server|tls|ready] [port]"
     IO.println ""
     IO.println "Modes:"
     IO.println "  client  - Run Lean client tests against Go server (default)"
     IO.println "  server  - Run Lean gRPC server for Go client testing"
     IO.println "  tls     - Run TLS/mTLS tests (Lean client <-> Lean server)"
+    IO.println "  ready   - Run wait-for-ready tests (Lean client <-> Lean server)"
     IO.println ""
     IO.println "Examples:"
     IO.println "  integrationTests client          # Test against Go server on localhost:50051"
     IO.println "  integrationTests server 50052    # Start Lean server on port 50052"
     IO.println "  integrationTests tls             # Run TLS tests"
+    IO.println "  integrationTests ready           # Run wait-for-ready tests"
     return 0
 
   | _ =>
     IO.eprintln s!"Unknown mode: {mode}"
-    IO.eprintln "Usage: integrationTests [client|server|tls] [port]"
+    IO.eprintln "Usage: integrationTests [client|server|tls|ready] [port]"
     return 1

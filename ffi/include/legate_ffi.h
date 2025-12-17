@@ -52,6 +52,7 @@ LEAN_EXPORT lean_obj_res legate_unary_call(
     b_lean_obj_arg request,         // ByteArray request payload
     uint64_t timeout_ms,            // Timeout in milliseconds (0 = no timeout)
     b_lean_obj_arg metadata,        // Array of (String × String) for headers
+    uint8_t wait_for_ready,         // 0 = fail fast if not ready; 1 = wait until ready (until deadline)
     lean_obj_arg world
 );
 
@@ -66,6 +67,7 @@ LEAN_EXPORT lean_obj_res legate_client_streaming_call_start(
     b_lean_obj_arg method,
     uint64_t timeout_ms,
     b_lean_obj_arg metadata,
+    uint8_t wait_for_ready,
     lean_obj_arg world
 );
 
@@ -101,6 +103,7 @@ LEAN_EXPORT lean_obj_res legate_server_streaming_call_start(
     b_lean_obj_arg request,
     uint64_t timeout_ms,
     b_lean_obj_arg metadata,
+    uint8_t wait_for_ready,
     lean_obj_arg world
 );
 
@@ -131,6 +134,7 @@ LEAN_EXPORT lean_obj_res legate_bidi_streaming_call_start(
     b_lean_obj_arg method,
     uint64_t timeout_ms,
     b_lean_obj_arg metadata,
+    uint8_t wait_for_ready,
     lean_obj_arg world
 );
 

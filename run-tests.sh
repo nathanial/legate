@@ -16,7 +16,7 @@ cd "$SCRIPT_DIR"
 # Lake doesn't always notice changes in the native (CMake-built) archive when
 # deciding whether to relink Lean dylibs/executables, so do it explicitly here.
 if [ -d "$SCRIPT_DIR/.lake/build/ffi" ]; then
-    echo -e "${YELLOW}[0/5] Building native FFI...${NC}"
+echo -e "${YELLOW}[0/6] Building native FFI...${NC}"
     echo "----------------------------------------"
     cmake --build "$SCRIPT_DIR/.lake/build/ffi" --parallel --target legate_ffi
     # Force relink of Lean shared libs/exes that embed the native archive
@@ -46,7 +46,7 @@ FAILED=0
 # ------------------------------------------------------------------------------
 # Unit Tests (Lean)
 # ------------------------------------------------------------------------------
-echo -e "${YELLOW}[1/5] Running Lean unit tests...${NC}"
+echo -e "${YELLOW}[1/6] Running Lean unit tests...${NC}"
 echo "----------------------------------------"
 
 if lake test; then
@@ -61,7 +61,7 @@ echo
 # ------------------------------------------------------------------------------
 # Integration Tests (Go client -> Go server)
 # ------------------------------------------------------------------------------
-echo -e "${YELLOW}[2/5] Running Go gRPC integration tests...${NC}"
+echo -e "${YELLOW}[2/6] Running Go gRPC integration tests...${NC}"
 echo "----------------------------------------"
 
 GO_TEST_DIR="$SCRIPT_DIR/Tests/integration/go"
@@ -111,7 +111,7 @@ echo
 # ------------------------------------------------------------------------------
 # Cross-Language Tests: Lean client -> Go server
 # ------------------------------------------------------------------------------
-echo -e "${YELLOW}[3/5] Running Lean client -> Go server tests...${NC}"
+echo -e "${YELLOW}[3/6] Running Lean client -> Go server tests...${NC}"
 echo "----------------------------------------"
 
 # Build Lean integration tests
@@ -152,7 +152,7 @@ echo
 # ------------------------------------------------------------------------------
 # Lean TLS/mTLS Tests: Lean client <-> Lean server
 # ------------------------------------------------------------------------------
-echo -e "${YELLOW}[4/5] Running Lean TLS/mTLS tests...${NC}"
+echo -e "${YELLOW}[4/6] Running Lean TLS/mTLS tests...${NC}"
 echo "----------------------------------------"
 
 if [ $INTEGRATION_BUILT -eq 1 ]; then
@@ -171,9 +171,30 @@ fi
 echo
 
 # ------------------------------------------------------------------------------
+# Lean WaitForReady Tests: Lean client <-> Lean server
+# ------------------------------------------------------------------------------
+echo -e "${YELLOW}[5/6] Running Lean WaitForReady tests...${NC}"
+echo "----------------------------------------"
+
+if [ $INTEGRATION_BUILT -eq 1 ]; then
+    echo "Running Lean wait-for-ready integration tests..."
+    if .lake/build/bin/integrationTests ready; then
+        echo -e "${GREEN}Lean WaitForReady tests passed${NC}"
+    else
+        echo -e "${RED}Lean WaitForReady tests failed${NC}"
+        FAILED=1
+    fi
+else
+    echo -e "${RED}Skipping WaitForReady tests (integrationTests failed to build)${NC}"
+    FAILED=1
+fi
+
+echo
+
+# ------------------------------------------------------------------------------
 # Cross-Language Tests: Go client -> Lean server
 # ------------------------------------------------------------------------------
-echo -e "${YELLOW}[5/5] Running Go client -> Lean server tests...${NC}"
+echo -e "${YELLOW}[6/6] Running Go client -> Lean server tests...${NC}"
 echo "----------------------------------------"
 
 # Start Lean server
