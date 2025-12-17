@@ -77,10 +77,41 @@ struct BidiStreamWrapper : StreamWrapperBase {
 };
 
 // Server-side types
+enum class HandlerType : uint8_t {
+    UNARY = 0,
+    CLIENT_STREAMING = 1,
+    SERVER_STREAMING = 2,
+    BIDI_STREAMING = 3
+};
+
 struct RegisteredHandler {
     std::string method;
-    uint8_t handler_type;  // 0=unary, 1=client, 2=server, 3=bidi
+    HandlerType type;
     lean_object* handler;  // Lean closure (inc-refed)
+
+    RegisteredHandler() : type(HandlerType::UNARY), handler(nullptr) {}
+    RegisteredHandler(const RegisteredHandler&) = delete;
+    RegisteredHandler& operator=(const RegisteredHandler&) = delete;
+    RegisteredHandler(RegisteredHandler&& other) noexcept
+        : method(std::move(other.method)), type(other.type), handler(other.handler) {
+        other.handler = nullptr;
+    }
+    RegisteredHandler& operator=(RegisteredHandler&& other) noexcept {
+        if (this != &other) {
+            if (handler) lean_dec(handler);
+            method = std::move(other.method);
+            type = other.type;
+            handler = other.handler;
+            other.handler = nullptr;
+        }
+        return *this;
+    }
+    ~RegisteredHandler() {
+        if (handler) {
+            lean_dec(handler);
+            handler = nullptr;
+        }
+    }
 };
 
 struct ServerBuilderWrapper {
@@ -94,28 +125,59 @@ struct ServerBuilderWrapper {
     }
 };
 
+// Forward declaration for call context
+struct ServerCallContext;
+
 struct ServerWrapper {
     std::unique_ptr<grpc::Server> server;
     std::unique_ptr<grpc::ServerCompletionQueue> cq;
     std::vector<RegisteredHandler> handlers;
+    grpc::AsyncGenericService* service = nullptr;  // Borrowed from builder
     std::thread polling_thread;
     std::atomic<bool> running{false};
 
+    RegisteredHandler* findHandler(const std::string& method) {
+        for (auto& h : handlers) {
+            if (h.method == method) {
+                return &h;
+            }
+        }
+        return nullptr;
+    }
+
     ~ServerWrapper() {
         if (running.load()) {
-            server->Shutdown();
-            cq->Shutdown();
+            running.store(false);
+            if (server) server->Shutdown();
+            if (cq) cq->Shutdown();
             if (polling_thread.joinable()) {
                 polling_thread.join();
             }
         }
-        // Dec-ref all handlers
-        for (auto& h : handlers) {
-            if (h.handler) {
-                lean_dec(h.handler);
-            }
-        }
+        // Handlers are cleaned up by their destructors
     }
+};
+
+// Server call context for tracking async operations
+struct ServerCallContext {
+    grpc::GenericServerContext ctx;
+    grpc::GenericServerAsyncReaderWriter stream;
+    ServerWrapper* server;
+    RegisteredHandler* handler;
+    grpc::ByteBuffer request;
+    grpc::ByteBuffer response;
+
+    enum class State {
+        ACCEPTING,
+        READING,
+        PROCESSING,
+        WRITING,
+        FINISHING,
+        DONE
+    } state;
+
+    ServerCallContext(ServerWrapper* s)
+        : stream(&ctx), server(s), handler(nullptr), state(State::ACCEPTING) {}
 };
 
 // ============================================================================
@@ -140,12 +202,7 @@ static void bidi_stream_finalizer(void* ptr) {
 
 static void server_builder_finalizer(void* ptr) {
     auto* wrapper = static_cast<ServerBuilderWrapper*>(ptr);
-    // Dec-ref handlers
-    for (auto& h : wrapper->handlers) {
-        if (h.handler) {
-            lean_dec(h.handler);
-        }
-    }
+    // Handlers are cleaned up by their destructors (RAII)
     delete wrapper;
 }
 
@@ -769,6 +826,134 @@ extern "C" LEAN_EXPORT lean_obj_res legate_bidi_stream_get_status(
 // Server Operations
 // ============================================================================
 
+// Helper to convert grpc metadata to Lean array
+static lean_object* server_metadata_to_lean(
+    const std::multimap<grpc::string_ref, grpc::string_ref>& metadata
+) {
+    lean_object* arr = lean_mk_empty_array();
+    for (const auto& [key, val] : metadata) {
+        lean_object* k = lean_mk_string_from_bytes(key.data(), key.size());
+        lean_object* v = lean_mk_string_from_bytes(val.data(), val.size());
+        lean_object* pair = mk_pair(k, v);
+        arr = lean_array_push(arr, pair);
+    }
+    return arr;
+}
+
+// Helper to extract result from Except GrpcError α
+// Returns true if ok, false if error
+// On success, sets *result to the ok value
+// On error, sets *error_code and *error_msg
+static bool extract_except_result(
+    lean_object* except_result,
+    lean_object** result,
+    int* error_code,
+    std::string* error_msg
+) {
+    // Except.error is ctor 0, Except.ok is ctor 1
+    unsigned tag = lean_obj_tag(except_result);
+    if (tag == 1) {
+        // Except.ok - extract the value
+        *result = lean_ctor_get(except_result, 0);
+        lean_inc(*result);
+        return true;
+    } else {
+        // Except.error - extract GrpcError
+        lean_object* grpc_error = lean_ctor_get(except_result, 0);
+        lean_object* code_obj = lean_ctor_get(grpc_error, 0);
+        lean_object* msg_obj = lean_ctor_get(grpc_error, 1);
+        *error_code = lean_unbox(code_obj);
+        *error_msg = lean_string_cstr(msg_obj);
+        return false;
+    }
+}
+
+// Process a unary call - called from the server polling loop
+static void process_unary_call(ServerCallContext* call_ctx) {
+    auto* handler = call_ctx->handler;
+    if (!handler || !handler->handler) {
+        // No handler - send unimplemented error
+        call_ctx->stream.Finish(
+            grpc::Status(grpc::StatusCode::UNIMPLEMENTED, "Method not implemented"),
+            call_ctx);
+        call_ctx->state = ServerCallContext::State::FINISHING;
+        return;
+    }
+
+    // Convert request to Lean ByteArray
+    lean_object* request_bytes = bytebuffer_to_lean_bytearray(call_ctx->request);
+
+    // Convert metadata to Lean array
+    lean_object* metadata = server_metadata_to_lean(call_ctx->ctx.client_metadata());
+
+    // Get method name
+    lean_object* method_str = lean_mk_string(call_ctx->ctx.method().c_str());
+
+    // Call the Lean handler: String → Metadata → ByteArray → IO (Except GrpcError (ByteArray × Metadata))
+    // We need to apply arguments one by one
+    lean_object* handler_obj = handler->handler;
+    lean_inc(handler_obj);
+
+    // Apply method string
+    lean_object* h1 = lean_apply_1(handler_obj, method_str);
+    // Apply metadata
+    lean_object* h2 = lean_apply_1(h1, metadata);
+    // Apply request bytes
+    lean_object* h3 = lean_apply_1(h2, request_bytes);
+    // Execute the IO action
+    lean_object* io_result = lean_io_result_mk_ok(lean_apply_1(h3, lean_io_mk_world()));
+
+    // Check if IO succeeded
+    if (lean_io_result_is_error(io_result)) {
+        lean_object* error = lean_io_result_get_error(io_result);
+        std::string err_msg = "IO error in handler";
+        if (lean_is_scalar(error)) {
+            err_msg = "Unknown IO error";
+        }
+        lean_dec(io_result);
+        call_ctx->stream.Finish(
+            grpc::Status(grpc::StatusCode::INTERNAL, err_msg),
+            call_ctx);
+        call_ctx->state = ServerCallContext::State::FINISHING;
+        return;
+    }
+
+    // Get the Except result
+    lean_object* except_result = lean_io_result_get_value(io_result);
+
+    lean_object* ok_value = nullptr;
+    int error_code = 0;
+    std::string error_msg;
+
+    if (extract_except_result(except_result, &ok_value, &error_code, &error_msg)) {
+        // Success - ok_value is (ByteArray × Metadata)
+        lean_object* response_bytes = lean_ctor_get(ok_value, 0);
+        // lean_object* trailing_metadata = lean_ctor_get(ok_value, 1);
+
+        // Convert response to ByteBuffer
+        size_t size = lean_sarray_size(response_bytes);
+        uint8_t* data = lean_sarray_cptr(response_bytes);
+        grpc::Slice slice(data, size);
+        call_ctx->response = grpc::ByteBuffer(&slice, 1);
+
+        lean_dec(ok_value);
+
+        // Write response
+        call_ctx->stream.Write(call_ctx->response, call_ctx);
+        call_ctx->state = ServerCallContext::State::WRITING;
+    } else {
+        // Error
+        lean_dec(io_result);
+        call_ctx->stream.Finish(
+            grpc::Status(static_cast<grpc::StatusCode>(error_code), error_msg),
+            call_ctx);
+        call_ctx->state = ServerCallContext::State::FINISHING;
+        return;
+    }
+
+    lean_dec(io_result);
+}
+
 extern "C" LEAN_EXPORT lean_obj_res legate_server_builder_new(lean_obj_arg /* world */) {
     if (!g_initialized.load()) {
         legate_init(lean_box(0));
@@ -789,7 +974,6 @@ extern "C" LEAN_EXPORT lean_obj_res legate_server_builder_add_listening_port(
     std::string addr_str = lean_string_to_std(addr);
 
     if (use_tls) {
-        // For TLS, would need to pass credentials - simplified for now
         wrapper->builder->AddListeningPort(
             addr_str,
             grpc::InsecureServerCredentials(),  // TODO: proper TLS support
@@ -802,10 +986,10 @@ extern "C" LEAN_EXPORT lean_obj_res legate_server_builder_add_listening_port(
     return mk_io_result_ok(lean_box(static_cast<unsigned>(wrapper->selected_port)));
 }
 
-extern "C" LEAN_EXPORT lean_obj_res legate_server_builder_register_handler(
+// Register a unary handler
+extern "C" LEAN_EXPORT lean_obj_res legate_server_register_unary(
     b_lean_obj_arg builder,
     b_lean_obj_arg method,
-    uint8_t handler_type,
     lean_obj_arg handler,
     lean_obj_arg /* world */
 ) {
@@ -813,9 +997,66 @@ extern "C" LEAN_EXPORT lean_obj_res legate_server_builder_register_handler(
 
     RegisteredHandler h;
     h.method = lean_string_to_std(method);
-    h.handler_type = handler_type;
+    h.type = HandlerType::UNARY;
     h.handler = handler;
-    lean_inc(handler);  // Keep handler alive
+    lean_inc(handler);
+
+    wrapper->handlers.push_back(std::move(h));
+    return mk_io_result_ok(lean_box(0));
+}
+
+// Register a client streaming handler
+extern "C" LEAN_EXPORT lean_obj_res legate_server_register_client_streaming(
+    b_lean_obj_arg builder,
+    b_lean_obj_arg method,
+    lean_obj_arg handler,
+    lean_obj_arg /* world */
+) {
+    auto* wrapper = static_cast<ServerBuilderWrapper*>(lean_get_external_data(builder));
+
+    RegisteredHandler h;
+    h.method = lean_string_to_std(method);
+    h.type = HandlerType::CLIENT_STREAMING;
+    h.handler = handler;
+    lean_inc(handler);
+
+    wrapper->handlers.push_back(std::move(h));
+    return mk_io_result_ok(lean_box(0));
+}
+
+// Register a server streaming handler
+extern "C" LEAN_EXPORT lean_obj_res legate_server_register_server_streaming(
+    b_lean_obj_arg builder,
+    b_lean_obj_arg method,
+    lean_obj_arg handler,
+    lean_obj_arg /* world */
+) {
+    auto* wrapper = static_cast<ServerBuilderWrapper*>(lean_get_external_data(builder));
+
+    RegisteredHandler h;
+    h.method = lean_string_to_std(method);
+    h.type = HandlerType::SERVER_STREAMING;
+    h.handler = handler;
+    lean_inc(handler);
+
+    wrapper->handlers.push_back(std::move(h));
+    return mk_io_result_ok(lean_box(0));
+}
+
+// Register a bidirectional streaming handler
+extern "C" LEAN_EXPORT lean_obj_res legate_server_register_bidi_streaming(
+    b_lean_obj_arg builder,
+    b_lean_obj_arg method,
+    lean_obj_arg handler,
+    lean_obj_arg /* world */
+) {
+    auto* wrapper = static_cast<ServerBuilderWrapper*>(lean_get_external_data(builder));
+
+    RegisteredHandler h;
+    h.method = lean_string_to_std(method);
+    h.type = HandlerType::BIDI_STREAMING;
+    h.handler = handler;
+    lean_inc(handler);
 
     wrapper->handlers.push_back(std::move(h));
     return mk_io_result_ok(lean_box(0));
@@ -829,6 +1070,9 @@ extern "C" LEAN_EXPORT lean_obj_res legate_server_builder_build(
 
     auto* s_wrapper = new ServerWrapper();
 
+    // Store service reference for RequestCall
+    s_wrapper->service = &b_wrapper->service;
+
     // Add completion queue
     s_wrapper->cq = b_wrapper->builder->AddCompletionQueue();
 
@@ -839,12 +1083,24 @@ extern "C" LEAN_EXPORT lean_obj_res legate_server_builder_build(
         return mk_io_error("Failed to build server");
     }
 
-    // Move handlers
-    s_wrapper->handlers = std::move(b_wrapper->handlers);
+    // Move handlers - use explicit loop since we deleted copy operations
+    for (auto& h : b_wrapper->handlers) {
+        s_wrapper->handlers.push_back(std::move(h));
+    }
     b_wrapper->handlers.clear();
 
     lean_object* obj = lean_alloc_external(g_server_class, s_wrapper);
     return mk_io_result_ok(obj);
+}
+
+// Start accepting a new call
+static void start_accepting(ServerWrapper* wrapper, grpc::ServerCompletionQueue* cq) {
+    auto* call_ctx = new ServerCallContext(wrapper);
+    wrapper->service->RequestCall(
+        &call_ctx->ctx,
+        &call_ctx->stream,
+        cq, cq,
+        call_ctx);
 }
 
 extern "C" LEAN_EXPORT lean_obj_res legate_server_start(
@@ -859,19 +1115,79 @@ extern "C" LEAN_EXPORT lean_obj_res legate_server_start(
 
     wrapper->running.store(true);
 
+    // Start accepting first call
+    start_accepting(wrapper, wrapper->cq.get());
+
     // Start the polling thread for handling requests
     wrapper->polling_thread = std::thread([wrapper]() {
-        // Simplified polling loop - actual implementation would dispatch to Lean handlers
         while (wrapper->running.load()) {
             void* tag;
             bool ok;
             auto deadline = std::chrono::system_clock::now() + std::chrono::milliseconds(100);
             auto status = wrapper->cq->AsyncNext(&tag, &ok, deadline);
+
             if (status == grpc::CompletionQueue::SHUTDOWN) {
                 break;
             }
-            if (status == grpc::CompletionQueue::GOT_EVENT && ok) {
-                // TODO: dispatch to appropriate handler based on tag
+
+            if (status == grpc::CompletionQueue::GOT_EVENT) {
+                auto* call_ctx = static_cast<ServerCallContext*>(tag);
+
+                if (!ok) {
+                    // Call was cancelled or failed
+                    delete call_ctx;
+                    continue;
+                }
+
+                switch (call_ctx->state) {
+                    case ServerCallContext::State::ACCEPTING: {
+                        // New call accepted - start accepting another
+                        start_accepting(wrapper, wrapper->cq.get());
+
+                        // Find handler for this method
+                        std::string method = call_ctx->ctx.method();
+                        call_ctx->handler = wrapper->findHandler(method);
+
+                        if (call_ctx->handler && call_ctx->handler->type == HandlerType::UNARY) {
+                            // For unary, read the request
+                            call_ctx->stream.Read(&call_ctx->request, call_ctx);
+                            call_ctx->state = ServerCallContext::State::READING;
+                        } else {
+                            // Unsupported handler type or not found
+                            call_ctx->stream.Finish(
+                                grpc::Status(grpc::StatusCode::UNIMPLEMENTED,
+                                    "Method not implemented or handler type not supported"),
+                                call_ctx);
+                            call_ctx->state = ServerCallContext::State::FINISHING;
+                        }
+                        break;
+                    }
+
+                    case ServerCallContext::State::READING: {
+                        // Request received, process it
+                        call_ctx->state = ServerCallContext::State::PROCESSING;
+                        process_unary_call(call_ctx);
+                        break;
+                    }
+
+                    case ServerCallContext::State::WRITING: {
+                        // Response written, finish the call
+                        call_ctx->stream.Finish(grpc::Status::OK, call_ctx);
+                        call_ctx->state = ServerCallContext::State::FINISHING;
+                        break;
+                    }
+
+                    case ServerCallContext::State::FINISHING: {
+                        // Call finished, clean up
+                        call_ctx->state = ServerCallContext::State::DONE;
+                        delete call_ctx;
+                        break;
+                    }
+
+                    default:
+                        delete call_ctx;
+                        break;
+                }
             }
         }
     });
@@ -915,6 +1231,5 @@ extern "C" LEAN_EXPORT lean_obj_res legate_server_shutdown_now(
     b_lean_obj_arg server,
     lean_obj_arg /* world */
 ) {
-    // Same as shutdown for now
     return legate_server_shutdown(server, lean_box(0));
 }

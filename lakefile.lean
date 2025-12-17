@@ -23,6 +23,18 @@ lean_exe tests where
   srcDir := "."
   moreLinkArgs := #["-L.lake/build/lib", "-lLegate", "-lTests"]
 
+-- Integration tests library - protobuf-based tests against Go server
+lean_lib IntegrationTests where
+  srcDir := "."
+  roots := #[`Tests.integration.Client, `Tests.integration.Server]
+  moreLinkArgs := #["-L.lake/build/lib", "-lLegate"]
+
+-- Integration test executable
+lean_exe integrationTests where
+  root := `Tests.integration.Main
+  srcDir := "."
+  moreLinkArgs := #["-L.lake/build/lib", "-lLegate", "-lIntegrationTests"]
+
 /-- Build script that invokes CMake to build the FFI library -/
 script buildFfi do
   -- Get Lean sysroot
@@ -50,7 +62,8 @@ script buildFfi do
       "-B", buildDir,
       s!"-DLEAN_INCLUDE_DIR={leanIncDir}",
       "-DCMAKE_BUILD_TYPE=Release",
-      "-DLEGATE_USE_SYSTEM_GRPC=OFF"
+      "-DLEGATE_USE_SYSTEM_GRPC=OFF",
+      "-DCMAKE_POLICY_VERSION_MINIMUM=3.5"
     ]
   }
   if configureOut.exitCode != 0 then

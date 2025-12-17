@@ -200,13 +200,48 @@ opaque serverBuilderAddListeningPort
     (useTls : UInt8)
     : IO UInt32
 
-/-- Register a handler -/
-@[extern "legate_server_builder_register_handler"]
-opaque serverBuilderRegisterHandler
+/-- Register a unary handler.
+    Handler receives: method name, client metadata, request bytes
+    Returns: response bytes and trailing metadata, or error
+-/
+@[extern "legate_server_register_unary"]
+opaque serverRegisterUnary
     (builder : @& ServerBuilder)
     (method : @& String)
-    (handlerType : UInt8)
-    (handler : @& (IO Unit))  -- Placeholder type, actual type varies
+    (handler : String → Metadata → ByteArray → IO (Except GrpcError (ByteArray × Metadata)))
+    : IO Unit
+
+/-- Register a client streaming handler.
+    Handler receives: method name, client metadata, recv function
+    Returns: response bytes and trailing metadata, or error
+-/
+@[extern "legate_server_register_client_streaming"]
+opaque serverRegisterClientStreaming
+    (builder : @& ServerBuilder)
+    (method : @& String)
+    (handler : String → Metadata → IO (Option ByteArray) → IO (Except GrpcError (ByteArray × Metadata)))
+    : IO Unit
+
+/-- Register a server streaming handler.
+    Handler receives: method name, client metadata, request bytes, send function
+    Returns: trailing metadata, or error
+-/
+@[extern "legate_server_register_server_streaming"]
+opaque serverRegisterServerStreaming
+    (builder : @& ServerBuilder)
+    (method : @& String)
+    (handler : String → Metadata → ByteArray → (ByteArray → IO Unit) → IO (Except GrpcError Metadata))
+    : IO Unit
+
+/-- Register a bidirectional streaming handler.
+    Handler receives: method name, client metadata, recv function, send function
+    Returns: trailing metadata, or error
+-/
+@[extern "legate_server_register_bidi_streaming"]
+opaque serverRegisterBidiStreaming
+    (builder : @& ServerBuilder)
+    (method : @& String)
+    (handler : String → Metadata → IO (Option ByteArray) → (ByteArray → IO Unit) → IO (Except GrpcError Metadata))
     : IO Unit
 
 /-- Build the server -/

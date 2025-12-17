@@ -101,9 +101,11 @@ def registerUnary
     (method : String)
     (handler : UnaryHandler)
     : IO Unit := do
-  -- Note: The actual handler registration with proper Lean closure support
-  -- requires more complex FFI. This is a placeholder.
-  Internal.serverBuilderRegisterHandler builder.handle method 0 (pure ())
+  -- Adapt user handler to FFI signature
+  let ffiHandler := fun (m : String) (md : Metadata) (req : ByteArray) => do
+    let ctx : ServerContext := { method := m, metadata := md }
+    handler ctx req
+  Internal.serverRegisterUnary builder.handle method ffiHandler
 
 /-- Register a client streaming handler for a method -/
 def registerClientStreaming
@@ -111,7 +113,11 @@ def registerClientStreaming
     (method : String)
     (handler : ClientStreamingHandler)
     : IO Unit := do
-  Internal.serverBuilderRegisterHandler builder.handle method 1 (pure ())
+  -- Adapt user handler to FFI signature
+  let ffiHandler := fun (m : String) (md : Metadata) (recv : IO (Option ByteArray)) => do
+    let ctx : ServerContext := { method := m, metadata := md }
+    handler ctx recv
+  Internal.serverRegisterClientStreaming builder.handle method ffiHandler
 
 /-- Register a server streaming handler for a method -/
 def registerServerStreaming
@@ -119,7 +125,11 @@ def registerServerStreaming
     (method : String)
     (handler : ServerStreamingHandler)
     : IO Unit := do
-  Internal.serverBuilderRegisterHandler builder.handle method 2 (pure ())
+  -- Adapt user handler to FFI signature
+  let ffiHandler := fun (m : String) (md : Metadata) (req : ByteArray) (send : ByteArray → IO Unit) => do
+    let ctx : ServerContext := { method := m, metadata := md }
+    handler ctx req send
+  Internal.serverRegisterServerStreaming builder.handle method ffiHandler
 
 /-- Register a bidirectional streaming handler for a method -/
 def registerBidiStreaming
@@ -127,7 +137,11 @@ def registerBidiStreaming
     (method : String)
     (handler : BidiStreamingHandler)
     : IO Unit := do
-  Internal.serverBuilderRegisterHandler builder.handle method 3 (pure ())
+  -- Adapt user handler to FFI signature
+  let ffiHandler := fun (m : String) (md : Metadata) (recv : IO (Option ByteArray)) (send : ByteArray → IO Unit) => do
+    let ctx : ServerContext := { method := m, metadata := md }
+    handler ctx recv send
+  Internal.serverRegisterBidiStreaming builder.handle method ffiHandler
 
 /-- Build the server.
 

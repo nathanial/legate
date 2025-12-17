@@ -21,7 +21,7 @@ FAILED=0
 # ------------------------------------------------------------------------------
 # Unit Tests (Lean)
 # ------------------------------------------------------------------------------
-echo -e "${YELLOW}[1/2] Running Lean unit tests...${NC}"
+echo -e "${YELLOW}[1/4] Running Lean unit tests...${NC}"
 echo "----------------------------------------"
 
 if lake test; then
@@ -34,12 +34,12 @@ fi
 echo
 
 # ------------------------------------------------------------------------------
-# Integration Tests (Go gRPC)
+# Integration Tests (Go client -> Go server)
 # ------------------------------------------------------------------------------
-echo -e "${YELLOW}[2/2] Running Go gRPC integration tests...${NC}"
+echo -e "${YELLOW}[2/4] Running Go gRPC integration tests...${NC}"
 echo "----------------------------------------"
 
-GO_TEST_DIR="$SCRIPT_DIR/tests/integration/go"
+GO_TEST_DIR="$SCRIPT_DIR/Tests/integration/go"
 
 if [ ! -d "$GO_TEST_DIR" ]; then
     echo -e "${RED}Go integration test directory not found: $GO_TEST_DIR${NC}"
@@ -56,35 +56,105 @@ else
     fi
 
     # Start server in background
-    echo "Starting gRPC test server..."
+    echo "Starting Go gRPC test server..."
     ./testapp server -port 50051 &
-    SERVER_PID=$!
+    GO_SERVER_PID=$!
 
     # Wait for server to start
     sleep 1
 
     # Check if server started successfully
-    if ! kill -0 $SERVER_PID 2>/dev/null; then
-        echo -e "${RED}Failed to start gRPC test server${NC}"
+    if ! kill -0 $GO_SERVER_PID 2>/dev/null; then
+        echo -e "${RED}Failed to start Go gRPC test server${NC}"
         FAILED=1
     else
-        # Run client tests
-        echo "Running client tests..."
+        # Run Go client tests
+        echo "Running Go client tests..."
         if ./testapp client -addr localhost:50051 -test all; then
             echo -e "${GREEN}Go gRPC integration tests passed${NC}"
         else
             echo -e "${RED}Go gRPC integration tests failed${NC}"
             FAILED=1
         fi
-
-        # Stop server
-        echo "Stopping gRPC test server..."
-        kill $SERVER_PID 2>/dev/null || true
-        wait $SERVER_PID 2>/dev/null || true
     fi
 fi
 
 cd "$SCRIPT_DIR"
+
+echo
+
+# ------------------------------------------------------------------------------
+# Cross-Language Tests: Lean client -> Go server
+# ------------------------------------------------------------------------------
+echo -e "${YELLOW}[3/4] Running Lean client -> Go server tests...${NC}"
+echo "----------------------------------------"
+
+# Build Lean integration tests
+echo "Building Lean integration tests..."
+if ! lake build integrationTests 2>&1; then
+    echo -e "${RED}Failed to build Lean integration tests${NC}"
+    FAILED=1
+else
+    # Check if Go server is still running, if not restart it
+    if ! kill -0 $GO_SERVER_PID 2>/dev/null; then
+        echo "Starting Go server for Lean client tests..."
+        cd "$GO_TEST_DIR"
+        ./testapp server -port 50051 &
+        GO_SERVER_PID=$!
+        sleep 1
+        cd "$SCRIPT_DIR"
+    fi
+
+    # Run Lean client tests against Go server
+    echo "Running Lean client tests against Go server..."
+    if .lake/build/bin/integrationTests client; then
+        echo -e "${GREEN}Lean client -> Go server tests passed${NC}"
+    else
+        echo -e "${RED}Lean client -> Go server tests failed${NC}"
+        FAILED=1
+    fi
+fi
+
+# Stop Go server
+echo "Stopping Go gRPC test server..."
+kill $GO_SERVER_PID 2>/dev/null || true
+wait $GO_SERVER_PID 2>/dev/null || true
+
+echo
+
+# ------------------------------------------------------------------------------
+# Cross-Language Tests: Go client -> Lean server
+# ------------------------------------------------------------------------------
+echo -e "${YELLOW}[4/4] Running Go client -> Lean server tests...${NC}"
+echo "----------------------------------------"
+
+# Start Lean server
+echo "Starting Lean gRPC server on port 50052..."
+.lake/build/bin/integrationTests server 50052 &
+LEAN_SERVER_PID=$!
+sleep 2
+
+# Check if Lean server started successfully
+if ! kill -0 $LEAN_SERVER_PID 2>/dev/null; then
+    echo -e "${RED}Failed to start Lean gRPC server${NC}"
+    FAILED=1
+else
+    # Run Go client tests against Lean server (unary only for now)
+    echo "Running Go client tests against Lean server..."
+    cd "$GO_TEST_DIR"
+    if ./testapp client -addr localhost:50052 -test unary; then
+        echo -e "${GREEN}Go client -> Lean server tests passed${NC}"
+    else
+        echo -e "${RED}Go client -> Lean server tests failed${NC}"
+        FAILED=1
+    fi
+    cd "$SCRIPT_DIR"
+
+    # Stop Lean server
+    echo "Stopping Lean gRPC server..."
+    kill $LEAN_SERVER_PID 2>/dev/null || true
+    wait $LEAN_SERVER_PID 2>/dev/null || true
+fi
 
 echo
 echo "========================================"
