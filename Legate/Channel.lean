@@ -53,6 +53,12 @@ structure SslCredentials where
   privateKey : String := ""
   /-- PEM-encoded certificate chain (optional, for mutual TLS) -/
   certChain : String := ""
+  /-- Override the hostname used for TLS verification (advanced).
+
+      This is passed through to gRPC as `grpc.ssl_target_name_override`.
+      Leave empty for safe defaults (verify against the channel target host).
+  -/
+  sslTargetNameOverride : String := ""
   deriving Repr, Inhabited
 
 namespace Channel
@@ -70,7 +76,12 @@ def createInsecure (target : String) : IO Channel := do
     The target should be in the form "host:port".
 -/
 def createSecure (target : String) (creds : SslCredentials := {}) : IO Channel := do
-  let handle ← Internal.channelCreateSecure target creds.rootCerts creds.privateKey creds.certChain
+  let handle ← Internal.channelCreateSecure
+    target
+    creds.rootCerts
+    creds.privateKey
+    creds.certChain
+    creds.sslTargetNameOverride
   return ⟨handle⟩
 
 /-- Get the current connectivity state of the channel.

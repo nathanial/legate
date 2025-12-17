@@ -38,6 +38,38 @@ structure ServerContext where
   /-- The peer address (if available) -/
   peer : String := ""
 
+/-- Client certificate authentication type for mTLS -/
+inductive ClientAuthType where
+  /-- Don't request client certificate -/
+  | none
+  /-- Request client certificate, verify if provided -/
+  | request
+  /-- Require client certificate and verify -/
+  | require
+  deriving Repr, DecidableEq, BEq
+
+namespace ClientAuthType
+
+def toUInt8 (t : ClientAuthType) : UInt8 :=
+  match t with
+  | .none => 0
+  | .request => 1
+  | .require => 2
+
+end ClientAuthType
+
+/-- SSL/TLS credentials for secure server connections -/
+structure SslServerCredentials where
+  /-- PEM-encoded server certificate chain -/
+  serverCert : String
+  /-- PEM-encoded server private key -/
+  serverKey : String
+  /-- PEM-encoded root certificates for client verification (optional, for mTLS) -/
+  rootCerts : String := ""
+  /-- Client certificate authentication type -/
+  clientAuth : ClientAuthType := .none
+  deriving Repr
+
 /-- A builder for configuring a gRPC server -/
 structure ServerBuilder where
   private mk ::
@@ -108,10 +140,27 @@ def addInsecurePort (builder : ServerBuilder) (addr : String) : IO UInt32 :=
 /-- Add a listening port for TLS connections.
 
     Returns the actually bound port (which may differ if 0 was specified).
-    Note: TLS credentials configuration is not yet fully implemented.
+
+    Example:
+    ```lean
+    let creds : SslServerCredentials := {
+      serverCert := serverCertPem,
+      serverKey := serverKeyPem,
+      -- For mTLS, also set:
+      -- rootCerts := caCertPem,
+      -- clientAuth := .require
+    }
+    let port ← builder.addSecurePort "0.0.0.0:0" creds
+    ```
 -/
-def addSecurePort (builder : ServerBuilder) (addr : String) : IO UInt32 :=
-  Internal.serverBuilderAddListeningPort builder.handle addr 1
+def addSecurePort (builder : ServerBuilder) (addr : String) (creds : SslServerCredentials) : IO UInt32 :=
+  Internal.serverBuilderAddSecureListeningPort
+    builder.handle
+    addr
+    creds.rootCerts
+    creds.serverCert
+    creds.serverKey
+    creds.clientAuth.toUInt8
 
 /-- Register a unary handler for a method -/
 def registerUnary
@@ -234,6 +283,26 @@ end Server
 def runServer (addr : String) (configure : ServerBuilder → IO Unit) : IO Unit := do
   let builder ← ServerBuilder.new
   let _ ← builder.addInsecurePort addr
+  configure builder
+  let server ← builder.build
+  server.run
+
+/-- Create and run a TLS server.
+
+    Example:
+    ```lean
+    let creds : SslServerCredentials := {
+      serverCert := serverCertPem,
+      serverKey := serverKeyPem,
+    }
+    Legate.runSecureServer "0.0.0.0:50051" creds fun builder => do
+      builder.registerUnary "/example.Echo/Echo" fun ctx req =>
+        return .ok (req, #[], #[])
+    ```
+-/
+def runSecureServer (addr : String) (creds : SslServerCredentials) (configure : ServerBuilder → IO Unit) : IO Unit := do
+  let builder ← ServerBuilder.new
+  let _ ← builder.addSecurePort addr creds
   configure builder
   let server ← builder.build
   server.run

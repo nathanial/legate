@@ -13,6 +13,8 @@ What's working and covered by tests today:
 - **Metadata:** Full support for request headers, response headers (initial metadata), and trailers for all RPC shapes
   - Lean client: access response headers via `response.headers` (unary) or `stream.getHeaders()` (streaming)
   - Lean server: return `(response, headers, trailers)` from handlers
+- **TLS / mTLS:** secure Lean client channels + secure Lean server ports
+  - Hostname/SAN verification on by default; hostname override supported for advanced cases (`SslCredentials.sslTargetNameOverride`)
 - **Deadlines + cancellation:** deadline-exceeded and cancel propagation for all RPC shapes (unary + streaming)
 - **Lean server call context:** server handlers can query cancellation and deadline remaining time
 - **Status & Errors:** Non-OK status propagation for all RPC shapes; rich error details support via `GrpcError.details`
@@ -51,9 +53,9 @@ The items below are the most important missing pieces for “typical” gRPC usa
 
 ### Transport & Security
 
-- **TLS:** secure client channel and secure server credentials are not implemented/tested
-- **mTLS:** client cert auth and server-side verification not implemented/tested
-- **Hostname/SAN verification:** not tested
+- ~~**TLS:** secure client channel and secure server credentials are not implemented/tested~~ ✅ **DONE**
+- ~~**mTLS:** client cert auth and server-side verification not implemented/tested~~ ✅ **DONE**
+- ~~**Hostname/SAN verification:** not tested~~ ✅ **DONE**
 
 ### Compression
 
@@ -135,7 +137,7 @@ This is the suggested order to reach “common gRPC feature parity” for Lean.
 **Definition of done** ✅
 - Lean can represent and validate common error patterns used by real gRPC services.
 
-### Phase 4 — TLS / mTLS
+### Phase 4 — TLS / mTLS ✅ **COMPLETE**
 
 **Add APIs**
 - Lean server: secure creds (TLS), plus mTLS options (client cert required/optional)

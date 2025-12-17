@@ -81,6 +81,7 @@ opaque channelCreateSecure
     (rootCerts : @& String)
     (privateKey : @& String)
     (certChain : @& String)
+    (sslTargetNameOverride : @& String)
     : IO Channel
 
 /-- Get channel connectivity state -/
@@ -227,12 +228,23 @@ opaque bidiStreamRead (stream : @& BidiStream) : IO (Except GrpcError (Option By
 @[extern "legate_server_builder_new"]
 opaque serverBuilderNew : IO ServerBuilder
 
-/-- Add a listening port -/
+/-- Add a listening port (insecure) -/
 @[extern "legate_server_builder_add_listening_port"]
 opaque serverBuilderAddListeningPort
     (builder : @& ServerBuilder)
     (addr : @& String)
     (useTls : UInt8)
+    : IO UInt32
+
+/-- Add a secure listening port with TLS credentials -/
+@[extern "legate_server_builder_add_secure_listening_port"]
+opaque serverBuilderAddSecureListeningPort
+    (builder : @& ServerBuilder)
+    (addr : @& String)
+    (rootCerts : @& String)      -- PEM root certs for client verification (empty = no client auth)
+    (serverCert : @& String)     -- PEM server certificate chain
+    (serverKey : @& String)      -- PEM server private key
+    (clientAuthType : UInt8)     -- 0 = none, 1 = request+verify, 2 = require+verify
     : IO UInt32
 
   /-- Register a unary handler.

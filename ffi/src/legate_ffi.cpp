@@ -17,6 +17,13 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+
+#include <netdb.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <unistd.h>
 
 // ============================================================================
 // External Class Registration
@@ -147,6 +154,7 @@ struct ServerBuilderWrapper {
     std::unique_ptr<grpc::ServerBuilder> builder;
     std::vector<RegisteredHandler> handlers;
     std::unique_ptr<grpc::AsyncGenericService> service;
+    std::vector<int> reserved_fds;
     int selected_port = 0;
 
     ServerBuilderWrapper()
@@ -547,6 +555,100 @@ static void apply_timeout(grpc::ClientContext* ctx, uint64_t timeout_ms) {
     }
 }
 
+// ============================================================================
+// Server port helpers
+// ============================================================================
+
+static bool split_host_port(const std::string& addr_uri, std::string* prefix,
+                            std::string* host, int* port) {
+    *prefix = "";
+    std::string hostport = addr_uri;
+    size_t scheme_pos = addr_uri.find(":///");
+    if (scheme_pos != std::string::npos) {
+        *prefix = addr_uri.substr(0, scheme_pos + 4); // include ":///"
+        hostport = addr_uri.substr(scheme_pos + 4);
+    }
+
+    if (hostport.empty()) return false;
+
+    if (hostport.front() == '[') {
+        size_t close = hostport.find(']');
+        if (close == std::string::npos) return false;
+        if (close + 2 > hostport.size() || hostport[close + 1] != ':') return false;
+        *host = hostport.substr(1, close - 1);
+        std::string port_s = hostport.substr(close + 2);
+        char* end = nullptr;
+        long p = std::strtol(port_s.c_str(), &end, 10);
+        if (end == nullptr || *end != '\0' || p < 0 || p > 65535) return false;
+        *port = static_cast<int>(p);
+        return true;
+    }
+
+    size_t colon = hostport.rfind(':');
+    if (colon == std::string::npos) return false;
+    *host = hostport.substr(0, colon);
+    std::string port_s = hostport.substr(colon + 1);
+    char* end = nullptr;
+    long p = std::strtol(port_s.c_str(), &end, 10);
+    if (end == nullptr || *end != '\0' || p < 0 || p > 65535) return false;
+    *port = static_cast<int>(p);
+    return true;
+}
+
+static std::string join_host_port(const std::string& prefix, const std::string& host, int port) {
+    std::string port_s = std::to_string(port);
+    if (host.find(':') != std::string::npos) {
+        return prefix + "[" + host + "]:" + port_s;
+    }
+    return prefix + host + ":" + port_s;
+}
+
+static int reserve_tcp_port(const std::string& host, int* out_port) {
+    *out_port = 0;
+    struct addrinfo hints;
+    std::memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags = AI_PASSIVE;
+
+    struct addrinfo* res = nullptr;
+    int rc = getaddrinfo(host.empty() ? nullptr : host.c_str(), "0", &hints, &res);
+    if (rc != 0 || res == nullptr) return -1;
+
+    int reserved_fd = -1;
+    for (struct addrinfo* ai = res; ai != nullptr; ai = ai->ai_next) {
+        int fd = ::socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        if (fd < 0) continue;
+
+        int one = 1;
+        (void)::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+
+        if (::bind(fd, ai->ai_addr, ai->ai_addrlen) == 0) {
+            struct sockaddr_storage ss;
+            socklen_t slen = sizeof(ss);
+            if (::getsockname(fd, reinterpret_cast<struct sockaddr*>(&ss), &slen) == 0) {
+                if (ss.ss_family == AF_INET) {
+                    auto* sin = reinterpret_cast<struct sockaddr_in*>(&ss);
+                    *out_port = ntohs(sin->sin_port);
+                } else if (ss.ss_family == AF_INET6) {
+                    auto* sin6 = reinterpret_cast<struct sockaddr_in6*>(&ss);
+                    *out_port = ntohs(sin6->sin6_port);
+                }
+            }
+            if (*out_port != 0) {
+                reserved_fd = fd;
+                break;
+            }
+            ::close(fd);
+            continue;
+        }
+        ::close(fd);
+    }
+
+    freeaddrinfo(res);
+    return reserved_fd;
+}
+
 // Apply Lean Metadata (Array (String × String)) as trailing metadata on a server context
 static void apply_trailing_metadata(grpc::ServerContext* ctx, b_lean_obj_arg metadata) {
     size_t len = lean_array_size(metadata);
@@ -623,6 +725,7 @@ extern "C" LEAN_EXPORT lean_obj_res legate_channel_create_secure(
     b_lean_obj_arg root_certs,
     b_lean_obj_arg private_key,
     b_lean_obj_arg cert_chain,
+    b_lean_obj_arg ssl_target_name_override,
     lean_obj_arg /* world */
 ) {
     if (!g_initialized.load()) {
@@ -633,6 +736,7 @@ extern "C" LEAN_EXPORT lean_obj_res legate_channel_create_secure(
     std::string root_certs_str = lean_string_to_std(root_certs);
     std::string private_key_str = lean_string_to_std(private_key);
     std::string cert_chain_str = lean_string_to_std(cert_chain);
+    std::string ssl_target_name_override_str = lean_string_to_std(ssl_target_name_override);
 
     grpc::SslCredentialsOptions opts;
     if (!root_certs_str.empty()) {
@@ -646,7 +750,11 @@ extern "C" LEAN_EXPORT lean_obj_res legate_channel_create_secure(
     }
 
     auto creds = grpc::SslCredentials(opts);
-    auto channel = grpc::CreateChannel(target_str, creds);
+    grpc::ChannelArguments args;
+    if (!ssl_target_name_override_str.empty()) {
+        args.SetSslTargetNameOverride(ssl_target_name_override_str);
+    }
+    auto channel = grpc::CreateCustomChannel(target_str, creds, args);
 
     auto* wrapper = new ChannelWrapper(channel);
     lean_object* obj = lean_alloc_external(g_channel_class, wrapper);
@@ -1579,15 +1687,89 @@ extern "C" LEAN_EXPORT lean_obj_res legate_server_builder_add_listening_port(
     auto* wrapper = static_cast<ServerBuilderWrapper*>(lean_get_external_data(builder));
     std::string addr_str = lean_string_to_std(addr);
 
-    if (use_tls) {
-        wrapper->builder->AddListeningPort(
-            addr_str,
-            grpc::InsecureServerCredentials(),  // TODO: proper TLS support
-            &wrapper->selected_port);
-    } else {
-        wrapper->builder->AddListeningPort(
-            addr_str, grpc::InsecureServerCredentials(), &wrapper->selected_port);
+    std::string prefix, host;
+    int port = 0;
+    if (split_host_port(addr_str, &prefix, &host, &port) && port == 0) {
+        int chosen = 0;
+        int fd = reserve_tcp_port(host, &chosen);
+        if (fd != -1 && chosen != 0) {
+            wrapper->reserved_fds.push_back(fd);
+            port = chosen;
+            addr_str = join_host_port(prefix, host, port);
+        } else if (fd != -1) {
+            ::close(fd);
+        }
     }
+    wrapper->selected_port = port;
+
+    // Note: For TLS support, use legate_server_builder_add_secure_listening_port
+    wrapper->builder->AddListeningPort(addr_str, grpc::InsecureServerCredentials(), nullptr);
+
+    return mk_io_result_ok(lean_box(static_cast<unsigned>(wrapper->selected_port)));
+}
+
+// Add a secure listening port with TLS credentials
+extern "C" LEAN_EXPORT lean_obj_res legate_server_builder_add_secure_listening_port(
+    b_lean_obj_arg builder,
+    b_lean_obj_arg addr,
+    b_lean_obj_arg root_certs,      // PEM root certs for client verification (empty = no client auth)
+    b_lean_obj_arg server_cert,     // PEM server certificate chain
+    b_lean_obj_arg server_key,      // PEM server private key
+    uint8_t client_auth_type,       // 0 = none, 1 = request, 2 = require
+    lean_obj_arg /* world */
+) {
+    auto* wrapper = static_cast<ServerBuilderWrapper*>(lean_get_external_data(builder));
+    std::string addr_str = lean_string_to_std(addr);
+    std::string root_certs_str = lean_string_to_std(root_certs);
+    std::string server_cert_str = lean_string_to_std(server_cert);
+    std::string server_key_str = lean_string_to_std(server_key);
+
+    std::string prefix, host;
+    int port = 0;
+    if (split_host_port(addr_str, &prefix, &host, &port) && port == 0) {
+        int chosen = 0;
+        int fd = reserve_tcp_port(host, &chosen);
+        if (fd != -1 && chosen != 0) {
+            wrapper->reserved_fds.push_back(fd);
+            port = chosen;
+            addr_str = join_host_port(prefix, host, port);
+        } else if (fd != -1) {
+            ::close(fd);
+        }
+    }
+    wrapper->selected_port = port;
+
+    grpc::SslServerCredentialsOptions opts;
+
+    // Set client certificate request type
+    switch (client_auth_type) {
+        case 0:
+            opts.client_certificate_request = GRPC_SSL_DONT_REQUEST_CLIENT_CERTIFICATE;
+            break;
+        case 1:
+            opts.client_certificate_request = GRPC_SSL_REQUEST_CLIENT_CERTIFICATE_AND_VERIFY;
+            break;
+        case 2:
+            opts.client_certificate_request = GRPC_SSL_REQUEST_AND_REQUIRE_CLIENT_CERTIFICATE_AND_VERIFY;
+            break;
+        default:
+            opts.client_certificate_request = GRPC_SSL_DONT_REQUEST_CLIENT_CERTIFICATE;
+            break;
+    }
+
+    // Set root certs for client verification (if mTLS)
+    if (!root_certs_str.empty()) {
+        opts.pem_root_certs = root_certs_str;
+    }
+
+    // Add server key-cert pair
+    grpc::SslServerCredentialsOptions::PemKeyCertPair key_cert_pair;
+    key_cert_pair.private_key = server_key_str;
+    key_cert_pair.cert_chain = server_cert_str;
+    opts.pem_key_cert_pairs.push_back(key_cert_pair);
+
+    auto creds = grpc::SslServerCredentials(opts);
+    wrapper->builder->AddListeningPort(addr_str, creds, nullptr);
 
     return mk_io_result_ok(lean_box(static_cast<unsigned>(wrapper->selected_port)));
 }
@@ -1686,6 +1868,13 @@ extern "C" LEAN_EXPORT lean_obj_res legate_server_builder_build(
 
     // Add completion queue
     s_wrapper->cq = b_wrapper->builder->AddCompletionQueue();
+
+    // If we reserved any ephemeral ports (addr :0), release them immediately
+    // before BuildAndStart() so gRPC can bind to the same ports.
+    for (int fd : b_wrapper->reserved_fds) {
+        if (fd != -1) ::close(fd);
+    }
+    b_wrapper->reserved_fds.clear();
 
     // Build the server
     s_wrapper->server = b_wrapper->builder->BuildAndStart();

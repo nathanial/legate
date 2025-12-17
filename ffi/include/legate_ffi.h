@@ -32,6 +32,7 @@ LEAN_EXPORT lean_obj_res legate_channel_create_secure(
     b_lean_obj_arg root_certs,      // Optional PEM root certificates (can be empty string)
     b_lean_obj_arg private_key,     // Optional PEM private key (can be empty string)
     b_lean_obj_arg cert_chain,      // Optional PEM certificate chain (can be empty string)
+    b_lean_obj_arg ssl_target_name_override,  // Optional override for hostname verification (can be empty string)
     lean_obj_arg world
 );
 
@@ -165,12 +166,24 @@ LEAN_EXPORT lean_obj_res legate_bidi_stream_cancel(b_lean_obj_arg stream, lean_o
 // Create a new server builder
 LEAN_EXPORT lean_obj_res legate_server_builder_new(lean_obj_arg world);
 
-// Add a listening port to the server builder
+// Add a listening port to the server builder (insecure)
 // Returns the actually bound port (may differ if port was 0)
 LEAN_EXPORT lean_obj_res legate_server_builder_add_listening_port(
     b_lean_obj_arg builder,
     b_lean_obj_arg addr,
-    uint8_t use_tls,                // 0 = insecure, 1 = TLS
+    uint8_t use_tls,                // Ignored, always insecure. Use secure version for TLS.
+    lean_obj_arg world
+);
+
+// Add a secure listening port with TLS credentials
+// Returns the actually bound port (may differ if port was 0)
+LEAN_EXPORT lean_obj_res legate_server_builder_add_secure_listening_port(
+    b_lean_obj_arg builder,
+    b_lean_obj_arg addr,
+    b_lean_obj_arg root_certs,      // PEM root certs for client verification (empty = no client auth)
+    b_lean_obj_arg server_cert,     // PEM server certificate chain
+    b_lean_obj_arg server_key,      // PEM server private key
+    uint8_t client_auth_type,       // 0 = none, 1 = request+verify, 2 = require+verify
     lean_obj_arg world
 );
 

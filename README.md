@@ -239,6 +239,7 @@ legate/
 This library provides the core gRPC transport layer. Current status:
 
 - [x] Channel creation (insecure and TLS)
+- [x] Mutual TLS (mTLS) client auth
 - [x] Unary calls
 - [x] Client streaming
 - [x] Server streaming
