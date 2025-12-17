@@ -14,6 +14,8 @@
 #include <thread>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 
 // ============================================================================
 // External Class Registration
@@ -77,11 +79,15 @@ struct BidiStreamWrapper : StreamWrapperBase {
     bool read_finished = false;
 };
 
+// Forward declaration for call context (needed for server-side streaming callbacks).
+struct ServerCallContext;
+
 // State object used for server-side streaming handler callbacks (recv/send).
 struct ServerIOState {
-    std::vector<grpc::ByteBuffer> in_messages;
-    std::vector<grpc::ByteBuffer> out_messages;
-    size_t in_index = 0;
+    ServerCallContext* call_ctx = nullptr;  // non-owning
+    bool read_finished = false;
+
+    explicit ServerIOState(ServerCallContext* c) : call_ctx(c) {}
 };
 
 // Server-side types
@@ -134,9 +140,6 @@ struct ServerBuilderWrapper {
         builder->RegisterAsyncGenericService(service.get());
     }
 };
-
-// Forward declaration for call context
-struct ServerCallContext;
 
 struct ServerWrapper {
     std::unique_ptr<grpc::Server> server;
@@ -346,14 +349,38 @@ static lean_object* mk_option_none() {
     return lean_box(0);  // Option.none
 }
 
+static bool debug_server_io_enabled() {
+    const char* v = std::getenv("LEGATE_DEBUG_SERVER_IO");
+    return v && v[0] != '\0' && v[0] != '0';
+}
+
 // IO callback: recv next message (IO (Option ByteArray))
 static lean_obj_res legate_server_recv_impl(lean_obj_arg state_obj, lean_obj_arg /* world */) {
     auto* state = static_cast<ServerIOState*>(lean_get_external_data(state_obj));
-    if (state->in_index >= state->in_messages.size()) {
+    if (!state->call_ctx || state->read_finished) {
+        state->read_finished = true;
         return mk_io_result_ok(mk_option_none());
     }
-    const auto& buf = state->in_messages[state->in_index++];
-    lean_object* data = bytebuffer_to_lean_bytearray(buf);
+
+    grpc::ByteBuffer msg;
+    if (debug_server_io_enabled()) {
+        std::fprintf(stderr, "[legate] server recv: Read\n");
+        std::fflush(stderr);
+    }
+    state->call_ctx->stream.Read(&msg, reinterpret_cast<void*>(1));
+    void* tag = nullptr;
+    bool ok = false;
+    state->call_ctx->call_cq.Next(&tag, &ok);
+    if (debug_server_io_enabled()) {
+        std::fprintf(stderr, "[legate] server recv: Read done ok=%d tag=%p\n", ok ? 1 : 0, tag);
+        std::fflush(stderr);
+    }
+    if (!ok) {
+        state->read_finished = true;
+        return mk_io_result_ok(mk_option_none());
+    }
+
+    lean_object* data = bytebuffer_to_lean_bytearray(msg);
     return mk_io_result_ok(mk_option_some(data));
 }
 
@@ -364,7 +391,23 @@ static lean_obj_res legate_server_send_impl(
     lean_obj_arg /* world */
 ) {
     auto* state = static_cast<ServerIOState*>(lean_get_external_data(state_obj));
-    state->out_messages.push_back(lean_bytearray_to_bytebuffer(data));
+    if (!state->call_ctx) {
+        return mk_io_result_ok(lean_box(0));
+    }
+
+    grpc::ByteBuffer buf = lean_bytearray_to_bytebuffer(data);
+    if (debug_server_io_enabled()) {
+        std::fprintf(stderr, "[legate] server send: Write\n");
+        std::fflush(stderr);
+    }
+    state->call_ctx->stream.Write(buf, reinterpret_cast<void*>(2));
+    void* tag = nullptr;
+    bool ok = false;
+    state->call_ctx->call_cq.Next(&tag, &ok);
+    if (debug_server_io_enabled()) {
+        std::fprintf(stderr, "[legate] server send: Write done ok=%d tag=%p\n", ok ? 1 : 0, tag);
+        std::fflush(stderr);
+    }
     return mk_io_result_ok(lean_box(0));
 }
 
@@ -977,27 +1020,6 @@ static bool server_read_one(ServerCallContext* call_ctx, grpc::ByteBuffer* out) 
     return ok;
 }
 
-static void server_read_all(ServerCallContext* call_ctx, std::vector<grpc::ByteBuffer>* out) {
-    grpc::ByteBuffer msg;
-    while (true) {
-        call_ctx->stream.Read(&msg, reinterpret_cast<void*>(1));
-        bool ok = false;
-        cq_next(call_ctx->call_cq, &ok);
-        if (!ok) break;
-        out->push_back(std::move(msg));
-        msg = grpc::ByteBuffer();
-    }
-}
-
-static void server_write_all(ServerCallContext* call_ctx, std::vector<grpc::ByteBuffer>* bufs) {
-    for (auto& buf : *bufs) {
-        call_ctx->stream.Write(buf, reinterpret_cast<void*>(2));
-        bool ok = false;
-        cq_next(call_ctx->call_cq, &ok);
-        if (!ok) break;
-    }
-}
-
 static void server_finish(ServerCallContext* call_ctx, const grpc::Status& status) {
     call_ctx->stream.Finish(status, reinterpret_cast<void*>(3));
     bool ok = false;
@@ -1072,8 +1094,13 @@ static void handle_server_call(ServerCallContext* call_ctx) {
         }
 
         case HandlerType::CLIENT_STREAMING: {
-            auto* state = new ServerIOState();
-            server_read_all(call_ctx, &state->in_messages);
+            auto* state = new ServerIOState(call_ctx);
+            struct CallCtxDisabler {
+                ServerIOState* state;
+                ~CallCtxDisabler() {
+                    if (state) state->call_ctx = nullptr;
+                }
+            } disabler{state};
             lean_object* state_obj = lean_alloc_external(g_server_io_state_class, state);
             lean_object* recv_action = mk_server_recv_action(state_obj);
 
@@ -1125,7 +1152,13 @@ static void handle_server_call(ServerCallContext* call_ctx) {
 
             lean_object* request_bytes = bytebuffer_to_lean_bytearray(request);
 
-            auto* state = new ServerIOState();
+            auto* state = new ServerIOState(call_ctx);
+            struct CallCtxDisabler {
+                ServerIOState* state;
+                ~CallCtxDisabler() {
+                    if (state) state->call_ctx = nullptr;
+                }
+            } disabler{state};
             lean_object* state_obj = lean_alloc_external(g_server_io_state_class, state);
             lean_object* send_fn = mk_server_send_fn(state_obj);
 
@@ -1158,14 +1191,18 @@ static void handle_server_call(ServerCallContext* call_ctx) {
             lean_dec(ok_value);
             lean_dec(io_result);
 
-            server_write_all(call_ctx, &state->out_messages);
             server_finish(call_ctx, grpc::Status::OK);
             return;
         }
 
         case HandlerType::BIDI_STREAMING: {
-            auto* state = new ServerIOState();
-            server_read_all(call_ctx, &state->in_messages);
+            auto* state = new ServerIOState(call_ctx);
+            struct CallCtxDisabler {
+                ServerIOState* state;
+                ~CallCtxDisabler() {
+                    if (state) state->call_ctx = nullptr;
+                }
+            } disabler{state};
             lean_object* state_obj = lean_alloc_external(g_server_io_state_class, state);
             lean_object* recv_action = mk_server_recv_action(state_obj);
             lean_inc(state_obj);
@@ -1199,7 +1236,6 @@ static void handle_server_call(ServerCallContext* call_ctx) {
             lean_dec(ok_value);
             lean_dec(io_result);
 
-            server_write_all(call_ctx, &state->out_messages);
             server_finish(call_ctx, grpc::Status::OK);
             return;
         }
@@ -1402,7 +1438,7 @@ extern "C" LEAN_EXPORT lean_obj_res legate_server_start(
                 // New call accepted - start accepting another immediately.
                 start_accepting(wrapper);
 
-                // Find handler for this method and handle the call synchronously using the per-call CQ.
+                // Find handler for this method and handle the call synchronously.
                 call_ctx->method = call_ctx->ctx.method();
                 call_ctx->handler = wrapper->findHandler(call_ctx->method);
                 handle_server_call(call_ctx);

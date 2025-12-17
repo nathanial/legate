@@ -150,51 +150,37 @@ func (c *Client) TestBidi(data []byte, count int) error {
 		return fmt.Errorf("BiEcho failed to start: %w", err)
 	}
 
-	// Send and receive concurrently
-	errCh := make(chan error, 1)
-	go func() {
-		for i := 0; i < count; i++ {
-			msg := []byte(fmt.Sprintf("%s-%d", string(data), i))
-			if err := stream.Send(&pb.BiEchoRequest{Data: msg}); err != nil {
-				errCh <- fmt.Errorf("BiEcho send failed: %w", err)
-				return
-			}
+	// Interleave send/recv to verify "immediate" streaming semantics.
+	for i := 0; i < count; i++ {
+		msg := []byte(fmt.Sprintf("%s-%d", string(data), i))
+		if err := stream.Send(&pb.BiEchoRequest{Data: msg}); err != nil {
+			return fmt.Errorf("BiEcho send failed: %w", err)
 		}
-		if err := stream.CloseSend(); err != nil {
-			errCh <- fmt.Errorf("BiEcho close send failed: %w", err)
-			return
-		}
-		errCh <- nil
-	}()
 
-	// Receive responses
-	received := 0
-	for {
 		resp, err := stream.Recv()
-		if err == io.EOF {
-			break
-		}
 		if err != nil {
 			return fmt.Errorf("BiEcho recv failed: %w", err)
 		}
 
 		expectedPrefix := fmt.Sprintf("%d:", resp.Sequence)
 		if !bytes.HasPrefix(resp.Data, []byte(expectedPrefix)) {
-			return fmt.Errorf("unexpected response format at seq %d: %q",
-				resp.Sequence, resp.Data)
+			return fmt.Errorf("unexpected response format at seq %d: %q", resp.Sequence, resp.Data)
 		}
-		received++
 	}
 
-	if err := <-errCh; err != nil {
-		return err
+	if err := stream.CloseSend(); err != nil {
+		return fmt.Errorf("BiEcho close send failed: %w", err)
 	}
 
-	if received != count {
-		return fmt.Errorf("unexpected message count: got %d, want %d", received, count)
+	// No extra responses expected after CloseSend.
+	if resp, err := stream.Recv(); err != io.EOF {
+		if err != nil {
+			return fmt.Errorf("BiEcho recv after CloseSend failed: %w", err)
+		}
+		return fmt.Errorf("unexpected extra response after CloseSend: %q", resp.Data)
 	}
 
-	log.Printf("Bidirectional streaming test passed: exchanged %d messages", received)
+	log.Printf("Bidirectional streaming test passed: exchanged %d messages", count)
 	return nil
 }
 

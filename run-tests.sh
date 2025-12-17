@@ -10,6 +10,22 @@ NC='\033[0m' # No Color
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
+# ------------------------------------------------------------------------------
+# Build native FFI (CMake) and force relink
+# ------------------------------------------------------------------------------
+# Lake doesn't always notice changes in the native (CMake-built) archive when
+# deciding whether to relink Lean dylibs/executables, so do it explicitly here.
+if [ -d "$SCRIPT_DIR/.lake/build/ffi" ]; then
+    echo -e "${YELLOW}[0/4] Building native FFI...${NC}"
+    echo "----------------------------------------"
+    cmake --build "$SCRIPT_DIR/.lake/build/ffi" --parallel --target legate_ffi
+    # Force relink of Lean shared libs/exes that embed the native archive
+    rm -f "$SCRIPT_DIR/.lake/build/lib/libLegate."* 2>/dev/null || true
+    rm -f "$SCRIPT_DIR/.lake/build/lib/libIntegrationTests."* 2>/dev/null || true
+    rm -f "$SCRIPT_DIR/.lake/build/bin/integrationTests" 2>/dev/null || true
+    echo
+fi
+
 # On macOS, Lake/Lean-built dylibs may depend on libLake_shared.dylib via @rpath.
 # Ensure the Lean toolchain lib directory is discoverable when running test executables.
 if [[ "$(uname -s)" == "Darwin" ]]; then
