@@ -10,9 +10,9 @@ option(LEGATE_USE_SYSTEM_GRPC "Use system-installed gRPC instead of submodule" O
 
 if(LEGATE_USE_SYSTEM_GRPC)
     find_package(gRPC CONFIG REQUIRED)
-    find_package(Protobuf CONFIG REQUIRED)
+    # gRPC brings in protobuf transitively, no need to find it separately
     set(GRPC_LIBRARIES gRPC::grpc++ gRPC::grpc)
-    set(PROTOBUF_LIBRARIES protobuf::libprotobuf)
+    set(PROTOBUF_LIBRARIES "")
 else()
     # Build gRPC from submodule
     set(GRPC_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/grpc")
@@ -29,13 +29,13 @@ else()
     set(gRPC_BUILD_GRPC_OBJECTIVE_C_PLUGIN OFF CACHE BOOL "" FORCE)
     set(gRPC_BUILD_CODEGEN OFF CACHE BOOL "" FORCE)
 
-    # Use bundled dependencies
+    # Use bundled dependencies except for zlib which has conflicts on macOS
     set(gRPC_ABSL_PROVIDER "module" CACHE STRING "" FORCE)
     set(gRPC_CARES_PROVIDER "module" CACHE STRING "" FORCE)
     set(gRPC_PROTOBUF_PROVIDER "module" CACHE STRING "" FORCE)
     set(gRPC_RE2_PROVIDER "module" CACHE STRING "" FORCE)
     set(gRPC_SSL_PROVIDER "module" CACHE STRING "" FORCE)
-    set(gRPC_ZLIB_PROVIDER "module" CACHE STRING "" FORCE)
+    set(gRPC_ZLIB_PROVIDER "package" CACHE STRING "" FORCE)
 
     # Add gRPC subdirectory
     add_subdirectory(${GRPC_SOURCE_DIR} ${CMAKE_BINARY_DIR}/grpc EXCLUDE_FROM_ALL)

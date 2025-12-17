@@ -53,17 +53,17 @@ struct StreamWrapperBase {
     virtual ~StreamWrapperBase() = default;
 };
 
-// Client streaming call wrapper
+// Client streaming call wrapper - using ReaderWriter for all streaming
 struct ClientStreamWrapper : StreamWrapperBase {
-    std::unique_ptr<grpc::GenericClientAsyncWriter> writer;
+    std::unique_ptr<grpc::GenericClientAsyncReaderWriter> stream;
     grpc::ByteBuffer response;
     grpc::CompletionQueue cq;
     bool writes_done = false;
 };
 
-// Server streaming call wrapper
+// Server streaming call wrapper - using ReaderWriter for all streaming
 struct ServerStreamWrapper : StreamWrapperBase {
-    std::unique_ptr<grpc::GenericClientAsyncReader> reader;
+    std::unique_ptr<grpc::GenericClientAsyncReaderWriter> stream;
     grpc::CompletionQueue cq;
     bool finished = false;
 };
@@ -470,9 +470,16 @@ extern "C" LEAN_EXPORT lean_obj_res legate_unary_call(
     grpc::ByteBuffer request_buf = lean_bytearray_to_bytebuffer(request);
     grpc::ByteBuffer response_buf;
 
-    // Synchronous unary call using the generic stub
-    grpc::Status status = wrapper->stub->UnaryCall(
-        &context, method_str, grpc::StubOptions(), &request_buf, &response_buf);
+    // Use async unary call with completion queue for synchronous behavior
+    grpc::CompletionQueue cq;
+    grpc::Status status;
+    auto reader = wrapper->stub->PrepareUnaryCall(&context, method_str, request_buf, &cq);
+    reader->StartCall();
+    reader->Finish(&response_buf, &status, reinterpret_cast<void*>(1));
+
+    void* tag;
+    bool ok;
+    cq.Next(&tag, &ok);
 
     if (status.ok()) {
         lean_object* response = bytebuffer_to_lean_bytearray(response_buf);
@@ -502,11 +509,11 @@ extern "C" LEAN_EXPORT lean_obj_res legate_client_streaming_call_start(
     apply_timeout(wrapper->context.get(), timeout_ms);
     apply_metadata(wrapper->context.get(), metadata);
 
-    // Start the async call
-    wrapper->writer = ch_wrapper->stub->PrepareUnaryCall(
-        wrapper->context.get(), method_str, &wrapper->response, &wrapper->cq);
+    // Use PrepareCall which returns a bidirectional stream
+    wrapper->stream = ch_wrapper->stub->PrepareCall(
+        wrapper->context.get(), method_str, &wrapper->cq);
 
-    wrapper->writer->StartCall(reinterpret_cast<void*>(1));
+    wrapper->stream->StartCall(reinterpret_cast<void*>(1));
 
     // Wait for start
     void* tag;
@@ -535,7 +542,7 @@ extern "C" LEAN_EXPORT lean_obj_res legate_client_stream_write(
     }
 
     grpc::ByteBuffer buf = lean_bytearray_to_bytebuffer(data);
-    wrapper->writer->Write(buf, reinterpret_cast<void*>(2));
+    wrapper->stream->Write(buf, reinterpret_cast<void*>(2));
 
     void* tag;
     bool ok;
@@ -558,7 +565,7 @@ extern "C" LEAN_EXPORT lean_obj_res legate_client_stream_writes_done(
         return mk_io_result_ok(mk_except_ok(lean_box(0)));
     }
 
-    wrapper->writer->WritesDone(reinterpret_cast<void*>(3));
+    wrapper->stream->WritesDone(reinterpret_cast<void*>(3));
     wrapper->writes_done = true;
 
     void* tag;
@@ -579,10 +586,15 @@ extern "C" LEAN_EXPORT lean_obj_res legate_client_stream_finish(
         legate_client_stream_writes_done(stream, lean_box(0));
     }
 
-    wrapper->writer->Finish(&wrapper->status, reinterpret_cast<void*>(4));
-
     void* tag;
     bool ok;
+
+    // Read the response from the server
+    wrapper->stream->Read(&wrapper->response, reinterpret_cast<void*>(4));
+    wrapper->cq.Next(&tag, &ok);
+
+    // Finish the call
+    wrapper->stream->Finish(&wrapper->status, reinterpret_cast<void*>(5));
     wrapper->cq.Next(&tag, &ok);
 
     if (wrapper->status.ok()) {
@@ -590,10 +602,9 @@ extern "C" LEAN_EXPORT lean_obj_res legate_client_stream_finish(
         lean_object* trailers = trailing_metadata_to_lean(
             wrapper->context->GetServerTrailingMetadata());
         lean_object* status = mk_status(wrapper->status);
-        lean_object* result = lean_alloc_ctor(0, 3, 0);
-        lean_ctor_set(result, 0, response);
-        lean_ctor_set(result, 1, trailers);
-        lean_ctor_set(result, 2, status);
+        // Lean tuple (A × B × C) is (A × (B × C)), so nest the pairs
+        lean_object* inner = mk_pair(trailers, status);
+        lean_object* result = mk_pair(response, inner);
         return mk_io_result_ok(mk_except_ok(result));
     } else {
         return mk_io_result_ok(mk_except_error(wrapper->status));
@@ -621,12 +632,10 @@ extern "C" LEAN_EXPORT lean_obj_res legate_server_streaming_call_start(
 
     grpc::ByteBuffer request_buf = lean_bytearray_to_bytebuffer(request);
 
-    wrapper->reader = ch_wrapper->stub->PrepareCall(
+    wrapper->stream = ch_wrapper->stub->PrepareCall(
         wrapper->context.get(), method_str, &wrapper->cq);
 
-    // Note: For server streaming, we need to use the Call interface differently
-    // This is a simplified implementation
-    wrapper->reader->StartCall(reinterpret_cast<void*>(1));
+    wrapper->stream->StartCall(reinterpret_cast<void*>(1));
 
     void* tag;
     bool ok;
@@ -636,6 +645,19 @@ extern "C" LEAN_EXPORT lean_obj_res legate_server_streaming_call_start(
         grpc::Status failed(grpc::StatusCode::INTERNAL, "Failed to start server streaming call");
         return mk_io_result_ok(mk_except_error(failed));
     }
+
+    // Send the request
+    wrapper->stream->Write(request_buf, reinterpret_cast<void*>(2));
+    wrapper->cq.Next(&tag, &ok);
+    if (!ok) {
+        delete wrapper;
+        grpc::Status failed(grpc::StatusCode::INTERNAL, "Failed to write request");
+        return mk_io_result_ok(mk_except_error(failed));
+    }
+
+    // Signal writes done (server streaming means we only send one message)
+    wrapper->stream->WritesDone(reinterpret_cast<void*>(3));
+    wrapper->cq.Next(&tag, &ok);
 
     lean_object* obj = lean_alloc_external(g_server_stream_class, wrapper);
     return mk_io_result_ok(mk_except_ok(obj));
@@ -652,7 +674,7 @@ extern "C" LEAN_EXPORT lean_obj_res legate_server_stream_read(
     }
 
     grpc::ByteBuffer response;
-    wrapper->reader->Read(&response, reinterpret_cast<void*>(2));
+    wrapper->stream->Read(&response, reinterpret_cast<void*>(4));
 
     void* tag;
     bool ok;
@@ -686,7 +708,7 @@ extern "C" LEAN_EXPORT lean_obj_res legate_server_stream_get_status(
 
     if (!wrapper->finished) {
         // Need to finish first
-        wrapper->reader->Finish(&wrapper->status, reinterpret_cast<void*>(3));
+        wrapper->stream->Finish(&wrapper->status, reinterpret_cast<void*>(5));
         void* tag;
         bool ok;
         wrapper->cq.Next(&tag, &ok);

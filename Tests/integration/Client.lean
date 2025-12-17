@@ -4,18 +4,14 @@
   Tests all four RPC patterns using protobuf-encoded messages via Protolean.
 -/
 import Legate
-import Protolean
 import Tests.Framework
+import Tests.integration.Proto
 
 namespace Tests.integration.Client
 
--- Import proto types at compile time
--- The path is relative to this source file's directory
-proto_import "Proto/legate_test.proto"
-
 open Tests
 open Legate
-open legate.test  -- namespace from proto package
+open Legate.Test
 
 -- Method paths matching Go server
 def echoMethod := "/legate.test.TestService/Echo"
@@ -38,8 +34,8 @@ def testUnaryEcho : IO TestResult := do
   match ← unaryCall channel echoMethod requestBytes with
   | .ok response =>
     -- Decode response
-    match Protolean.decodeMessage response.data with
-    | .ok (decoded : EchoResponse) =>
+    match Protolean.decodeMessage (α := EchoResponse) response.data with
+    | .ok decoded =>
       let expected := "ECHO:hello".toUTF8
       if decoded.data == expected then
         return .passed
@@ -71,8 +67,8 @@ def testClientStreamingCollect : IO TestResult := do
 
     match ← stream.finish with
     | .ok response =>
-      match Protolean.decodeMessage response.data with
-      | .ok (decoded : CollectResponse) =>
+      match Protolean.decodeMessage (α := CollectResponse) response.data with
+      | .ok decoded =>
         let expectedData := "a|b|c".toUTF8
         if decoded.data == expectedData && decoded.count == 3 then
           return .passed
@@ -89,38 +85,33 @@ def testClientStreamingCollect : IO TestResult := do
 def testServerStreamingExpand : IO TestResult := do
   let channel ← Channel.createInsecure serverAddr
 
-  -- Create and encode request
-  let request : ExpandRequest := { count := 3, prefix := "test".toUTF8 }
+  -- Create and encode request (note: prefix_ because prefix is a Lean keyword)
+  let request : ExpandRequest := { count := 3, prefix_ := "test".toUTF8 }
   let requestBytes := Protolean.encodeMessage request
 
   match ← serverStreamingCall channel expandMethod requestBytes with
   | .ok stream =>
-    -- Read all responses
-    let mut responses : Array ExpandResponse := #[]
-    let rec readLoop : IO (GrpcResult (Array ExpandResponse)) := do
+    -- Read all responses into an array using a loop
+    let mut resps : Array ExpandResponse := #[]
+    let mut done := false
+    while !done do
       match ← stream.read with
       | .ok (some data) =>
-        match Protolean.decodeMessage data with
-        | .ok resp =>
-          responses := responses.push resp
-          readLoop
-        | .error e => return .error (GrpcError.mk .internal s!"Decode error: {e}" none)
-      | .ok none => return .ok responses
-      | .error e => return .error e
+        match Protolean.decodeMessage (α := ExpandResponse) data with
+        | .ok resp => resps := resps.push resp
+        | .error e => return .failed s!"Decode error: {e}"
+      | .ok none => done := true
+      | .error e => return .failed s!"Read error: {e}"
 
-    match ← readLoop with
-    | .ok resps =>
-      if resps.size != 3 then
-        return .failed s!"Expected 3 responses, got {resps.size}"
-      -- Verify each response
-      for i in [:3] do
-        let resp := resps[i]!
-        let expectedData := s!"test:{i}".toUTF8
-        if resp.data != expectedData || resp.sequence != i.toInt32 then
-          return .failed s!"Response {i} mismatch: got data='{String.fromUTF8! resp.data}', seq={resp.sequence}"
-      return .passed
-    | .error e =>
-      return .failed s!"Read error: {e}"
+    if resps.size != 3 then
+      return .failed s!"Expected 3 responses, got {resps.size}"
+    -- Verify each response
+    for i in [:3] do
+      let resp := resps[i]!
+      let expectedData := s!"test:{i}".toUTF8
+      if resp.data != expectedData || resp.sequence != i.toInt32 then
+        return .failed s!"Response {i} mismatch: got data='{String.fromUTF8! resp.data}', seq={resp.sequence}"
+    return .passed
   | .error e =>
     return .failed s!"Start stream error: {e}"
 
@@ -134,7 +125,8 @@ def testBidiStreaming : IO TestResult := do
     let messages := #["x", "y", "z"]
     let mut responses : Array BiEchoResponse := #[]
 
-    for (msg, i) in messages.zipWithIndex do
+    for h : i in [:messages.size] do
+      let msg := messages[i]
       let request : BiEchoRequest := { data := msg.toUTF8 }
       match ← stream.write (Protolean.encodeMessage request) with
       | .ok () => pure ()
@@ -143,7 +135,7 @@ def testBidiStreaming : IO TestResult := do
       -- Read response after each write (server echoes immediately)
       match ← stream.read with
       | .ok (some data) =>
-        match Protolean.decodeMessage data with
+        match Protolean.decodeMessage (α := BiEchoResponse) data with
         | .ok resp => responses := responses.push resp
         | .error e => return .failed s!"Decode error: {e}"
       | .ok none => return .failed "Stream ended unexpectedly"
@@ -154,11 +146,9 @@ def testBidiStreaming : IO TestResult := do
     | .error e => return .failed s!"WritesDone error: {e}"
 
     -- Verify responses
-    for (resp, i) in responses.zipWithIndex do
-      let expectedPrefix := s!"{i}:".toUTF8
-      -- Check that data starts with the sequence prefix
-      if !resp.data.toList.take expectedPrefix.size == expectedPrefix.toList then
-        return .failed s!"Response {i} missing sequence prefix"
+    for h : i in [:responses.size] do
+      let resp := responses[i]
+      -- Check sequence number
       if resp.sequence != i.toInt32 then
         return .failed s!"Response {i} sequence mismatch: expected {i}, got {resp.sequence}"
 

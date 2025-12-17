@@ -5,20 +5,18 @@
 -/
 import Legate
 import Protolean
+import Tests.integration.Proto
 
 namespace Tests.integration.Server
 
--- Import proto types at compile time
-proto_import "Proto/legate_test.proto"
-
 open Legate
-open legate.test  -- namespace from proto package
+open Legate.Test
 
 /-- Echo handler: returns "ECHO:" + request data -/
-def handleEcho (ctx : ServerContext) (requestBytes : ByteArray)
+def handleEcho (_ctx : ServerContext) (requestBytes : ByteArray)
     : IO (GrpcResult (ByteArray × Metadata)) := do
-  match Protolean.decodeMessage requestBytes with
-  | .ok (request : EchoRequest) =>
+  match Protolean.decodeMessage (α := EchoRequest) requestBytes with
+  | .ok request =>
     let responseData := "ECHO:".toUTF8 ++ request.data
     let response : EchoResponse := { data := responseData }
     return .ok (Protolean.encodeMessage response, #[])
@@ -27,26 +25,22 @@ def handleEcho (ctx : ServerContext) (requestBytes : ByteArray)
 
 /-- Collect handler: joins all messages with "|"
     Note: Streaming handlers are not yet fully implemented in the FFI.
-    This is a placeholder that will be enabled when streaming is supported.
 -/
-def handleCollect (ctx : ServerContext) (recv : IO (Option ByteArray))
+def handleCollect (_ctx : ServerContext) (recv : IO (Option ByteArray))
     : IO (GrpcResult (ByteArray × Metadata)) := do
+  -- Read all messages using a loop
   let mut parts : Array ByteArray := #[]
   let mut count : Int32 := 0
-
-  -- Read all messages
-  let rec loop : IO Unit := do
+  let mut done := false
+  while !done do
     match ← recv with
     | some bytes =>
-      match Protolean.decodeMessage bytes with
-      | .ok (request : CollectRequest) =>
+      match Protolean.decodeMessage (α := CollectRequest) bytes with
+      | .ok request =>
         parts := parts.push request.data
         count := count + 1
-        loop
-      | .error _ => loop  -- Skip malformed messages
-    | none => pure ()
-
-  loop
+      | .error _ => pure ()  -- Skip malformed messages
+    | none => done := true
 
   -- Join with "|"
   let joined := parts.foldl (init := ByteArray.empty) fun acc part =>
@@ -59,12 +53,12 @@ def handleCollect (ctx : ServerContext) (recv : IO (Option ByteArray))
 /-- Expand handler: sends N numbered responses
     Note: Streaming handlers are not yet fully implemented in the FFI.
 -/
-def handleExpand (ctx : ServerContext) (requestBytes : ByteArray) (send : ByteArray → IO Unit)
+def handleExpand (_ctx : ServerContext) (requestBytes : ByteArray) (send : ByteArray → IO Unit)
     : IO (GrpcResult Metadata) := do
-  match Protolean.decodeMessage requestBytes with
-  | .ok (request : ExpandRequest) =>
-    for i in [:request.count.toNat] do
-      let data := s!"{String.fromUTF8! request.prefix}:{i}".toUTF8
+  match Protolean.decodeMessage (α := ExpandRequest) requestBytes with
+  | .ok request =>
+    for i in [:request.count.toInt.toNat] do
+      let data := s!"{String.fromUTF8! request.prefix_}:{i}".toUTF8
       let response : ExpandResponse := { data := data, sequence := i.toInt32 }
       send (Protolean.encodeMessage response)
     return .ok #[]
@@ -74,24 +68,22 @@ def handleExpand (ctx : ServerContext) (requestBytes : ByteArray) (send : ByteAr
 /-- BiEcho handler: echoes each message with sequence number
     Note: Streaming handlers are not yet fully implemented in the FFI.
 -/
-def handleBiEcho (ctx : ServerContext) (recv : IO (Option ByteArray)) (send : ByteArray → IO Unit)
+def handleBiEcho (_ctx : ServerContext) (recv : IO (Option ByteArray)) (send : ByteArray → IO Unit)
     : IO (GrpcResult Metadata) := do
   let mut seq : Int32 := 0
-
-  let rec loop : IO Unit := do
+  let mut done := false
+  while !done do
     match ← recv with
     | some bytes =>
-      match Protolean.decodeMessage bytes with
-      | .ok (request : BiEchoRequest) =>
+      match Protolean.decodeMessage (α := BiEchoRequest) bytes with
+      | .ok request =>
         let data := s!"{seq}:{String.fromUTF8! request.data}".toUTF8
         let response : BiEchoResponse := { data := data, sequence := seq }
         send (Protolean.encodeMessage response)
         seq := seq + 1
-        loop
-      | .error _ => loop  -- Skip malformed
-    | none => pure ()
+      | .error _ => pure ()  -- Skip malformed
+    | none => done := true
 
-  loop
   return .ok #[]
 
 /-- Start the Lean TestService server -/

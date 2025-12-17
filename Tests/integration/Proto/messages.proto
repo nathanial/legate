@@ -1,0 +1,39 @@
+syntax = "proto3";
+
+package legate.test;
+
+message EchoRequest {
+  bytes data = 1;
+}
+
+message EchoResponse {
+  bytes data = 1;
+}
+
+message CollectRequest {
+  bytes data = 1;
+}
+
+message CollectResponse {
+  bytes data = 1;
+  int32 count = 2;
+}
+
+message ExpandRequest {
+  int32 count = 1;
+  bytes prefix = 2;
+}
+
+message ExpandResponse {
+  bytes data = 1;
+  int32 sequence = 2;
+}
+
+message BiEchoRequest {
+  bytes data = 1;
+}
+
+message BiEchoResponse {
+  bytes data = 1;
+  int32 sequence = 2;
+}

@@ -16,3 +16,5 @@
 
 # CMake build directories (if building outside of Lake)
 /ffi/build/
+
+testapp
