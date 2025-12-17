@@ -148,10 +148,10 @@ if ! kill -0 $LEAN_SERVER_PID 2>/dev/null; then
     echo -e "${RED}Failed to start Lean gRPC server${NC}"
     FAILED=1
 else
-    # Run Go client tests against Lean server (unary only for now)
+    # Run Go client tests against Lean server
     echo "Running Go client tests against Lean server..."
     cd "$GO_TEST_DIR"
-    if ./testapp client -addr localhost:50052 -test unary; then
+    if ./testapp client -addr localhost:50052 -test all; then
         echo -e "${GREEN}Go client -> Lean server tests passed${NC}"
     else
         echo -e "${RED}Go client -> Lean server tests failed${NC}"

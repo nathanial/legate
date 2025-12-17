@@ -25,6 +25,7 @@ static lean_external_class* g_server_stream_class = nullptr;
 static lean_external_class* g_bidi_stream_class = nullptr;
 static lean_external_class* g_server_builder_class = nullptr;
 static lean_external_class* g_server_class = nullptr;
+static lean_external_class* g_server_io_state_class = nullptr;
 
 static std::mutex g_init_mutex;
 static std::atomic<bool> g_initialized{false};
@@ -74,6 +75,13 @@ struct BidiStreamWrapper : StreamWrapperBase {
     grpc::CompletionQueue cq;
     bool writes_done = false;
     bool read_finished = false;
+};
+
+// State object used for server-side streaming handler callbacks (recv/send).
+struct ServerIOState {
+    std::vector<grpc::ByteBuffer> in_messages;
+    std::vector<grpc::ByteBuffer> out_messages;
+    size_t in_index = 0;
 };
 
 // Server-side types
@@ -164,22 +172,13 @@ struct ServerWrapper {
 struct ServerCallContext {
     grpc::GenericServerContext ctx;
     grpc::GenericServerAsyncReaderWriter stream;
+    grpc::CompletionQueue call_cq;
     ServerWrapper* server;
     RegisteredHandler* handler;
-    grpc::ByteBuffer request;
-    grpc::ByteBuffer response;
-
-    enum class State {
-        ACCEPTING,
-        READING,
-        PROCESSING,
-        WRITING,
-        FINISHING,
-        DONE
-    } state;
+    std::string method;
 
     ServerCallContext(ServerWrapper* s)
-        : stream(&ctx), server(s), handler(nullptr), state(State::ACCEPTING) {}
+        : stream(&ctx), server(s), handler(nullptr) {}
 };
 
 // ============================================================================
@@ -212,6 +211,10 @@ static void server_finalizer(void* ptr) {
     delete static_cast<ServerWrapper*>(ptr);
 }
 
+static void server_io_state_finalizer(void* ptr) {
+    delete static_cast<ServerIOState*>(ptr);
+}
+
 static void noop_foreach(void*, b_lean_obj_arg) {}
 
 // ============================================================================
@@ -226,6 +229,7 @@ static void init_external_classes() {
         g_bidi_stream_class = lean_register_external_class(bidi_stream_finalizer, noop_foreach);
         g_server_builder_class = lean_register_external_class(server_builder_finalizer, noop_foreach);
         g_server_class = lean_register_external_class(server_finalizer, noop_foreach);
+        g_server_io_state_class = lean_register_external_class(server_io_state_finalizer, noop_foreach);
     }
 }
 
@@ -342,6 +346,42 @@ static lean_object* mk_option_none() {
     return lean_box(0);  // Option.none
 }
 
+// IO callback: recv next message (IO (Option ByteArray))
+static lean_obj_res legate_server_recv_impl(lean_obj_arg state_obj, lean_obj_arg /* world */) {
+    auto* state = static_cast<ServerIOState*>(lean_get_external_data(state_obj));
+    if (state->in_index >= state->in_messages.size()) {
+        return mk_io_result_ok(mk_option_none());
+    }
+    const auto& buf = state->in_messages[state->in_index++];
+    lean_object* data = bytebuffer_to_lean_bytearray(buf);
+    return mk_io_result_ok(mk_option_some(data));
+}
+
+// IO callback: record a response message (ByteArray → IO Unit)
+static lean_obj_res legate_server_send_impl(
+    lean_obj_arg state_obj,
+    b_lean_obj_arg data,
+    lean_obj_arg /* world */
+) {
+    auto* state = static_cast<ServerIOState*>(lean_get_external_data(state_obj));
+    state->out_messages.push_back(lean_bytearray_to_bytebuffer(data));
+    return mk_io_result_ok(lean_box(0));
+}
+
+static lean_object* mk_server_recv_action(lean_object* state_obj) {
+    // arity 2: (state, world) -> IO.Result (Option ByteArray)
+    lean_object* c = lean_alloc_closure((void*)legate_server_recv_impl, 2, 1);
+    lean_closure_set(c, 0, state_obj);
+    return c;
+}
+
+static lean_object* mk_server_send_fn(lean_object* state_obj) {
+    // arity 3: (state, ByteArray, world) -> IO.Result Unit
+    lean_object* c = lean_alloc_closure((void*)legate_server_send_impl, 3, 1);
+    lean_closure_set(c, 0, state_obj);
+    return c;
+}
+
 // Convert Lean metadata array to gRPC metadata
 static void apply_metadata(grpc::ClientContext* ctx, b_lean_obj_arg metadata) {
     size_t len = lean_array_size(metadata);
@@ -372,6 +412,17 @@ static void apply_timeout(grpc::ClientContext* ctx, uint64_t timeout_ms) {
     if (timeout_ms > 0) {
         ctx->set_deadline(std::chrono::system_clock::now() +
                          std::chrono::milliseconds(timeout_ms));
+    }
+}
+
+// Apply Lean Metadata (Array (String × String)) as trailing metadata on a server context
+static void apply_trailing_metadata(grpc::ServerContext* ctx, b_lean_obj_arg metadata) {
+    size_t len = lean_array_size(metadata);
+    for (size_t i = 0; i < len; i++) {
+        lean_object* pair = lean_array_get_core(metadata, i);
+        lean_object* key = lean_ctor_get(pair, 0);
+        lean_object* val = lean_ctor_get(pair, 1);
+        ctx->AddTrailingMetadata(lean_string_to_std(key), lean_string_to_std(val));
     }
 }
 
@@ -906,89 +957,255 @@ static bool extract_except_result(
 }
 
 // Process a unary call - called from the server polling loop
-static void process_unary_call(ServerCallContext* call_ctx) {
+static grpc::Status grpc_status_from_lean_error(int error_code, const std::string& error_msg) {
+    // Lean StatusCode uses the same numeric mapping as gRPC core status codes.
+    return grpc::Status(static_cast<grpc::StatusCode>(error_code), error_msg);
+}
+
+static bool cq_next(grpc::CompletionQueue& cq, bool* ok_out) {
+    void* tag;
+    bool ok = false;
+    bool alive = cq.Next(&tag, &ok);
+    if (ok_out) *ok_out = ok;
+    return alive;
+}
+
+static bool server_read_one(ServerCallContext* call_ctx, grpc::ByteBuffer* out) {
+    call_ctx->stream.Read(out, reinterpret_cast<void*>(1));
+    bool ok = false;
+    cq_next(call_ctx->call_cq, &ok);
+    return ok;
+}
+
+static void server_read_all(ServerCallContext* call_ctx, std::vector<grpc::ByteBuffer>* out) {
+    grpc::ByteBuffer msg;
+    while (true) {
+        call_ctx->stream.Read(&msg, reinterpret_cast<void*>(1));
+        bool ok = false;
+        cq_next(call_ctx->call_cq, &ok);
+        if (!ok) break;
+        out->push_back(std::move(msg));
+        msg = grpc::ByteBuffer();
+    }
+}
+
+static void server_write_all(ServerCallContext* call_ctx, std::vector<grpc::ByteBuffer>* bufs) {
+    for (auto& buf : *bufs) {
+        call_ctx->stream.Write(buf, reinterpret_cast<void*>(2));
+        bool ok = false;
+        cq_next(call_ctx->call_cq, &ok);
+        if (!ok) break;
+    }
+}
+
+static void server_finish(ServerCallContext* call_ctx, const grpc::Status& status) {
+    call_ctx->stream.Finish(status, reinterpret_cast<void*>(3));
+    bool ok = false;
+    cq_next(call_ctx->call_cq, &ok);
+    // Drain and shutdown the per-call CQ.
+    call_ctx->call_cq.Shutdown();
+    while (true) {
+        bool alive = cq_next(call_ctx->call_cq, nullptr);
+        if (!alive) break;
+    }
+}
+
+static void handle_server_call(ServerCallContext* call_ctx) {
     auto* handler = call_ctx->handler;
     if (!handler || !handler->handler) {
-        // No handler - send unimplemented error
-        call_ctx->stream.Finish(
-            grpc::Status(grpc::StatusCode::UNIMPLEMENTED, "Method not implemented"),
-            call_ctx);
-        call_ctx->state = ServerCallContext::State::FINISHING;
+        server_finish(call_ctx, grpc::Status(grpc::StatusCode::UNIMPLEMENTED, "Method not implemented"));
         return;
     }
-
-    // Convert request to Lean ByteArray
-    lean_object* request_bytes = bytebuffer_to_lean_bytearray(call_ctx->request);
 
     // Convert metadata to Lean array
     lean_object* metadata = server_metadata_to_lean(call_ctx->ctx.client_metadata());
+    // Method name
+    lean_object* method_str = lean_mk_string(call_ctx->method.c_str());
 
-    // Get method name
-    lean_object* method_str = lean_mk_string(call_ctx->ctx.method().c_str());
+    switch (handler->type) {
+        case HandlerType::UNARY: {
+            grpc::ByteBuffer request;
+            if (!server_read_one(call_ctx, &request)) {
+                server_finish(call_ctx, grpc::Status(grpc::StatusCode::INTERNAL, "Failed to read unary request"));
+                return;
+            }
 
-    // Call the Lean handler: String → Metadata → ByteArray → IO (Except GrpcError (ByteArray × Metadata))
-    // We need to apply arguments one by one
-    lean_object* handler_obj = handler->handler;
-    lean_inc(handler_obj);
+            lean_object* request_bytes = bytebuffer_to_lean_bytearray(request);
 
-    // Apply method string
-    lean_object* h1 = lean_apply_1(handler_obj, method_str);
-    // Apply metadata
-    lean_object* h2 = lean_apply_1(h1, metadata);
-    // Apply request bytes
-    lean_object* h3 = lean_apply_1(h2, request_bytes);
-    // Execute the IO action by applying the world token; this returns an `IO.Result` directly.
-    lean_object* io_result = lean_apply_1(h3, lean_io_mk_world());
+            lean_object* handler_obj = handler->handler;
+            lean_inc(handler_obj);
+            lean_object* h1 = lean_apply_1(handler_obj, method_str);
+            lean_object* h2 = lean_apply_1(h1, metadata);
+            lean_object* h3 = lean_apply_1(h2, request_bytes);
+            lean_object* io_result = lean_apply_1(h3, lean_io_mk_world());
 
-    // Check if IO succeeded
-    if (lean_io_result_is_error(io_result)) {
-        lean_object* error = lean_io_result_get_error(io_result);
-        std::string err_msg = "IO error in handler";
-        if (lean_is_scalar(error)) {
-            err_msg = "Unknown IO error";
+            if (lean_io_result_is_error(io_result)) {
+                lean_dec(io_result);
+                server_finish(call_ctx, grpc::Status(grpc::StatusCode::INTERNAL, "IO error in unary handler"));
+                return;
+            }
+
+            lean_object* except_result = lean_io_result_get_value(io_result);
+            lean_object* ok_value = nullptr;
+            int error_code = 0;
+            std::string error_msg;
+            if (!extract_except_result(except_result, &ok_value, &error_code, &error_msg)) {
+                lean_dec(io_result);
+                server_finish(call_ctx, grpc_status_from_lean_error(error_code, error_msg));
+                return;
+            }
+
+            // ok_value : (ByteArray × Metadata)
+            lean_object* response_bytes = lean_ctor_get(ok_value, 0);
+            lean_object* trailers = lean_ctor_get(ok_value, 1);
+            apply_trailing_metadata(&call_ctx->ctx, trailers);
+
+            grpc::ByteBuffer response = lean_bytearray_to_bytebuffer(response_bytes);
+            call_ctx->stream.Write(response, reinterpret_cast<void*>(2));
+            bool ok = false;
+            cq_next(call_ctx->call_cq, &ok);
+            lean_dec(ok_value);
+            lean_dec(io_result);
+
+            server_finish(call_ctx, grpc::Status::OK);
+            return;
         }
-        lean_dec(io_result);
-        call_ctx->stream.Finish(
-            grpc::Status(grpc::StatusCode::INTERNAL, err_msg),
-            call_ctx);
-        call_ctx->state = ServerCallContext::State::FINISHING;
-        return;
+
+        case HandlerType::CLIENT_STREAMING: {
+            auto* state = new ServerIOState();
+            server_read_all(call_ctx, &state->in_messages);
+            lean_object* state_obj = lean_alloc_external(g_server_io_state_class, state);
+            lean_object* recv_action = mk_server_recv_action(state_obj);
+
+            lean_object* handler_obj = handler->handler;
+            lean_inc(handler_obj);
+            lean_object* h1 = lean_apply_1(handler_obj, method_str);
+            lean_object* h2 = lean_apply_1(h1, metadata);
+            lean_object* h3 = lean_apply_1(h2, recv_action);
+            lean_object* io_result = lean_apply_1(h3, lean_io_mk_world());
+
+            if (lean_io_result_is_error(io_result)) {
+                lean_dec(io_result);
+                server_finish(call_ctx, grpc::Status(grpc::StatusCode::INTERNAL, "IO error in client-streaming handler"));
+                return;
+            }
+
+            lean_object* except_result = lean_io_result_get_value(io_result);
+            lean_object* ok_value = nullptr;
+            int error_code = 0;
+            std::string error_msg;
+            if (!extract_except_result(except_result, &ok_value, &error_code, &error_msg)) {
+                lean_dec(io_result);
+                server_finish(call_ctx, grpc_status_from_lean_error(error_code, error_msg));
+                return;
+            }
+
+            // ok_value : (ByteArray × Metadata)
+            lean_object* response_bytes = lean_ctor_get(ok_value, 0);
+            lean_object* trailers = lean_ctor_get(ok_value, 1);
+            apply_trailing_metadata(&call_ctx->ctx, trailers);
+
+            grpc::ByteBuffer response = lean_bytearray_to_bytebuffer(response_bytes);
+            call_ctx->stream.Write(response, reinterpret_cast<void*>(2));
+            bool ok = false;
+            cq_next(call_ctx->call_cq, &ok);
+            lean_dec(ok_value);
+            lean_dec(io_result);
+
+            server_finish(call_ctx, grpc::Status::OK);
+            return;
+        }
+
+        case HandlerType::SERVER_STREAMING: {
+            grpc::ByteBuffer request;
+            if (!server_read_one(call_ctx, &request)) {
+                server_finish(call_ctx, grpc::Status(grpc::StatusCode::INTERNAL, "Failed to read server-streaming request"));
+                return;
+            }
+
+            lean_object* request_bytes = bytebuffer_to_lean_bytearray(request);
+
+            auto* state = new ServerIOState();
+            lean_object* state_obj = lean_alloc_external(g_server_io_state_class, state);
+            lean_object* send_fn = mk_server_send_fn(state_obj);
+
+            lean_object* handler_obj = handler->handler;
+            lean_inc(handler_obj);
+            lean_object* h1 = lean_apply_1(handler_obj, method_str);
+            lean_object* h2 = lean_apply_1(h1, metadata);
+            lean_object* h3 = lean_apply_1(h2, request_bytes);
+            lean_object* h4 = lean_apply_1(h3, send_fn);
+            lean_object* io_result = lean_apply_1(h4, lean_io_mk_world());
+
+            if (lean_io_result_is_error(io_result)) {
+                lean_dec(io_result);
+                server_finish(call_ctx, grpc::Status(grpc::StatusCode::INTERNAL, "IO error in server-streaming handler"));
+                return;
+            }
+
+            lean_object* except_result = lean_io_result_get_value(io_result);
+            lean_object* ok_value = nullptr;
+            int error_code = 0;
+            std::string error_msg;
+            if (!extract_except_result(except_result, &ok_value, &error_code, &error_msg)) {
+                lean_dec(io_result);
+                server_finish(call_ctx, grpc_status_from_lean_error(error_code, error_msg));
+                return;
+            }
+
+            // ok_value : Metadata
+            apply_trailing_metadata(&call_ctx->ctx, ok_value);
+            lean_dec(ok_value);
+            lean_dec(io_result);
+
+            server_write_all(call_ctx, &state->out_messages);
+            server_finish(call_ctx, grpc::Status::OK);
+            return;
+        }
+
+        case HandlerType::BIDI_STREAMING: {
+            auto* state = new ServerIOState();
+            server_read_all(call_ctx, &state->in_messages);
+            lean_object* state_obj = lean_alloc_external(g_server_io_state_class, state);
+            lean_object* recv_action = mk_server_recv_action(state_obj);
+            lean_inc(state_obj);
+            lean_object* send_fn = mk_server_send_fn(state_obj);
+
+            lean_object* handler_obj = handler->handler;
+            lean_inc(handler_obj);
+            lean_object* h1 = lean_apply_1(handler_obj, method_str);
+            lean_object* h2 = lean_apply_1(h1, metadata);
+            lean_object* h3 = lean_apply_1(h2, recv_action);
+            lean_object* h4 = lean_apply_1(h3, send_fn);
+            lean_object* io_result = lean_apply_1(h4, lean_io_mk_world());
+
+            if (lean_io_result_is_error(io_result)) {
+                lean_dec(io_result);
+                server_finish(call_ctx, grpc::Status(grpc::StatusCode::INTERNAL, "IO error in bidi handler"));
+                return;
+            }
+
+            lean_object* except_result = lean_io_result_get_value(io_result);
+            lean_object* ok_value = nullptr;
+            int error_code = 0;
+            std::string error_msg;
+            if (!extract_except_result(except_result, &ok_value, &error_code, &error_msg)) {
+                lean_dec(io_result);
+                server_finish(call_ctx, grpc_status_from_lean_error(error_code, error_msg));
+                return;
+            }
+
+            apply_trailing_metadata(&call_ctx->ctx, ok_value);
+            lean_dec(ok_value);
+            lean_dec(io_result);
+
+            server_write_all(call_ctx, &state->out_messages);
+            server_finish(call_ctx, grpc::Status::OK);
+            return;
+        }
     }
 
-    // Get the Except result
-    lean_object* except_result = lean_io_result_get_value(io_result);
-
-    lean_object* ok_value = nullptr;
-    int error_code = 0;
-    std::string error_msg;
-
-    if (extract_except_result(except_result, &ok_value, &error_code, &error_msg)) {
-        // Success - ok_value is (ByteArray × Metadata)
-        lean_object* response_bytes = lean_ctor_get(ok_value, 0);
-        // lean_object* trailing_metadata = lean_ctor_get(ok_value, 1);
-
-        // Convert response to ByteBuffer
-        size_t size = lean_sarray_size(response_bytes);
-        uint8_t* data = lean_sarray_cptr(response_bytes);
-        grpc::Slice slice(data, size);
-        call_ctx->response = grpc::ByteBuffer(&slice, 1);
-
-        lean_dec(ok_value);
-
-        // Write response
-        call_ctx->stream.Write(call_ctx->response, call_ctx);
-        call_ctx->state = ServerCallContext::State::WRITING;
-    } else {
-        // Error
-        lean_dec(io_result);
-        call_ctx->stream.Finish(
-            grpc::Status(static_cast<grpc::StatusCode>(error_code), error_msg),
-            call_ctx);
-        call_ctx->state = ServerCallContext::State::FINISHING;
-        return;
-    }
-
-    lean_dec(io_result);
+    server_finish(call_ctx, grpc::Status(grpc::StatusCode::UNIMPLEMENTED, "Handler type not supported"));
 }
 
 extern "C" LEAN_EXPORT lean_obj_res legate_server_builder_new(lean_obj_arg /* world */) {
@@ -1135,13 +1352,14 @@ extern "C" LEAN_EXPORT lean_obj_res legate_server_builder_build(
     return mk_io_result_ok(obj);
 }
 
-// Start accepting a new call
-static void start_accepting(ServerWrapper* wrapper, grpc::ServerCompletionQueue* cq) {
+// Start accepting a new call (notification events are delivered on wrapper->cq).
+static void start_accepting(ServerWrapper* wrapper) {
     auto* call_ctx = new ServerCallContext(wrapper);
     wrapper->service->RequestCall(
         &call_ctx->ctx,
         &call_ctx->stream,
-        cq, cq,
+        &call_ctx->call_cq,
+        wrapper->cq.get(),
         call_ctx);
 }
 
@@ -1158,7 +1376,7 @@ extern "C" LEAN_EXPORT lean_obj_res legate_server_start(
     wrapper->running.store(true);
 
     // Start accepting first call
-    start_accepting(wrapper, wrapper->cq.get());
+    start_accepting(wrapper);
 
     // Start the polling thread for handling requests
     wrapper->polling_thread = std::thread([wrapper]() {
@@ -1181,55 +1399,14 @@ extern "C" LEAN_EXPORT lean_obj_res legate_server_start(
                     continue;
                 }
 
-                switch (call_ctx->state) {
-                    case ServerCallContext::State::ACCEPTING: {
-                        // New call accepted - start accepting another
-                        start_accepting(wrapper, wrapper->cq.get());
+                // New call accepted - start accepting another immediately.
+                start_accepting(wrapper);
 
-                        // Find handler for this method
-                        std::string method = call_ctx->ctx.method();
-                        call_ctx->handler = wrapper->findHandler(method);
-
-                        if (call_ctx->handler && call_ctx->handler->type == HandlerType::UNARY) {
-                            // For unary, read the request
-                            call_ctx->stream.Read(&call_ctx->request, call_ctx);
-                            call_ctx->state = ServerCallContext::State::READING;
-                        } else {
-                            // Unsupported handler type or not found
-                            call_ctx->stream.Finish(
-                                grpc::Status(grpc::StatusCode::UNIMPLEMENTED,
-                                    "Method not implemented or handler type not supported"),
-                                call_ctx);
-                            call_ctx->state = ServerCallContext::State::FINISHING;
-                        }
-                        break;
-                    }
-
-                    case ServerCallContext::State::READING: {
-                        // Request received, process it
-                        call_ctx->state = ServerCallContext::State::PROCESSING;
-                        process_unary_call(call_ctx);
-                        break;
-                    }
-
-                    case ServerCallContext::State::WRITING: {
-                        // Response written, finish the call
-                        call_ctx->stream.Finish(grpc::Status::OK, call_ctx);
-                        call_ctx->state = ServerCallContext::State::FINISHING;
-                        break;
-                    }
-
-                    case ServerCallContext::State::FINISHING: {
-                        // Call finished, clean up
-                        call_ctx->state = ServerCallContext::State::DONE;
-                        delete call_ctx;
-                        break;
-                    }
-
-                    default:
-                        delete call_ctx;
-                        break;
-                }
+                // Find handler for this method and handle the call synchronously using the per-call CQ.
+                call_ctx->method = call_ctx->ctx.method();
+                call_ctx->handler = wrapper->findHandler(call_ctx->method);
+                handle_server_call(call_ctx);
+                delete call_ctx;
             }
         }
     });

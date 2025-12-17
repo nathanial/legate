@@ -93,11 +93,8 @@ def runTestServer (port : Nat := 50051) : IO Unit := do
 
   runServer addr fun builder => do
     builder.registerUnary "/legate.test.TestService/Echo" handleEcho
-    -- Note: Streaming handlers registration - the handlers are defined but
-    -- streaming FFI support is only partially implemented.
-    -- These will return UNIMPLEMENTED until streaming is fully working.
-    -- builder.registerClientStreaming "/legate.test.TestService/Collect" handleCollect
-    -- builder.registerServerStreaming "/legate.test.TestService/Expand" handleExpand
-    -- builder.registerBidiStreaming "/legate.test.TestService/BiEcho" handleBiEcho
+    builder.registerClientStreaming "/legate.test.TestService/Collect" handleCollect
+    builder.registerServerStreaming "/legate.test.TestService/Expand" handleExpand
+    builder.registerBidiStreaming "/legate.test.TestService/BiEcho" handleBiEcho
 
 end Tests.integration.Server
