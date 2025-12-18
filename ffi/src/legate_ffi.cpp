@@ -9,6 +9,7 @@
 #include <memory>
 #include <mutex>
 #include <condition_variable>
+#include <deque>
 #include <string>
 #include <vector>
 #include <unordered_map>
@@ -178,6 +179,10 @@ struct ServerWrapper {
     std::vector<RegisteredHandler> handlers;
     std::unique_ptr<grpc::AsyncGenericService> service;
     std::thread polling_thread;
+    std::vector<std::thread> worker_threads;
+    std::mutex work_mu;
+    std::condition_variable work_cv;
+    std::deque<ServerCallContext*> work_q;
     std::atomic<bool> running{false};
 
     RegisteredHandler* findHandler(const std::string& method) {
@@ -219,6 +224,20 @@ ServerWrapper::~ServerWrapper() {
     if (cq) cq->Shutdown();
     if (polling_thread.joinable()) {
         polling_thread.join();
+    }
+    // Stop workers.
+    work_cv.notify_all();
+    for (auto& t : worker_threads) {
+        if (t.joinable()) t.join();
+    }
+    worker_threads.clear();
+    // Best-effort cleanup for any still-queued calls.
+    {
+        std::lock_guard<std::mutex> lock(work_mu);
+        while (!work_q.empty()) {
+            delete work_q.front();
+            work_q.pop_front();
+        }
     }
     // Drain server CQ before destruction (required by gRPC).
     if (cq) {
@@ -426,6 +445,20 @@ static bool debug_server_io_enabled() {
 }
 
 static bool cq_wait_for_tag(grpc::CompletionQueue& cq, void* expected_tag, bool* ok_out);
+
+static unsigned server_worker_count() {
+    const char* v = std::getenv("LEGATE_SERVER_WORKERS");
+    if (v && v[0] != '\0') {
+        char* end = nullptr;
+        long n = std::strtol(v, &end, 10);
+        if (end != v && n > 0 && n < 1024) return static_cast<unsigned>(n);
+    }
+    unsigned n = std::thread::hardware_concurrency();
+    if (n == 0) n = 4;
+    if (n < 2) n = 2;
+    if (n > 8) n = 8;
+    return n;
+}
 
 extern "C" LEAN_EXPORT lean_obj_res legate_server_call_is_cancelled(
     b_lean_obj_arg call,
@@ -1988,6 +2021,47 @@ static void start_accepting(ServerWrapper* wrapper) {
         call_ctx);
 }
 
+static void ensure_worker_pool_started(ServerWrapper* wrapper) {
+    if (!wrapper || !wrapper->worker_threads.empty()) return;
+    unsigned n = server_worker_count();
+    if (debug_server_io_enabled()) {
+        std::fprintf(stderr, "[legate] server: starting %u worker(s)\n", n);
+        std::fflush(stderr);
+    }
+    wrapper->worker_threads.reserve(n);
+    for (unsigned i = 0; i < n; ++i) {
+        wrapper->worker_threads.emplace_back([wrapper]() {
+            while (true) {
+                ServerCallContext* call_ctx = nullptr;
+                {
+                    std::unique_lock<std::mutex> lock(wrapper->work_mu);
+                    wrapper->work_cv.wait(lock, [wrapper]() {
+                        return !wrapper->work_q.empty() || !wrapper->running.load();
+                    });
+                    if (!wrapper->work_q.empty()) {
+                        call_ctx = wrapper->work_q.front();
+                        wrapper->work_q.pop_front();
+                    } else if (!wrapper->running.load()) {
+                        break;
+                    }
+                }
+                if (call_ctx) {
+                    handle_server_call(call_ctx);
+                    delete call_ctx;
+                }
+            }
+        });
+    }
+}
+
+static void enqueue_server_call(ServerWrapper* wrapper, ServerCallContext* call_ctx) {
+    {
+        std::lock_guard<std::mutex> lock(wrapper->work_mu);
+        wrapper->work_q.push_back(call_ctx);
+    }
+    wrapper->work_cv.notify_one();
+}
+
 extern "C" LEAN_EXPORT lean_obj_res legate_server_start(
     b_lean_obj_arg server,
     lean_obj_arg /* world */
@@ -2003,6 +2077,8 @@ extern "C" LEAN_EXPORT lean_obj_res legate_server_start(
     }
 
     wrapper->running.store(true);
+
+    ensure_worker_pool_started(wrapper);
 
     // Start accepting first call
     start_accepting(wrapper);
@@ -2034,8 +2110,7 @@ extern "C" LEAN_EXPORT lean_obj_res legate_server_start(
                 // Find handler for this method and handle the call synchronously.
                 call_ctx->method = call_ctx->ctx.method();
                 call_ctx->handler = wrapper->findHandler(call_ctx->method);
-                handle_server_call(call_ctx);
-                delete call_ctx;
+                enqueue_server_call(wrapper, call_ctx);
             }
         }
     });
@@ -2068,6 +2143,19 @@ extern "C" LEAN_EXPORT lean_obj_res legate_server_shutdown(
     if (wrapper->cq) wrapper->cq->Shutdown();
     if (wrapper->polling_thread.joinable()) {
         wrapper->polling_thread.join();
+    }
+    // Stop workers.
+    wrapper->work_cv.notify_all();
+    for (auto& t : wrapper->worker_threads) {
+        if (t.joinable()) t.join();
+    }
+    wrapper->worker_threads.clear();
+    {
+        std::lock_guard<std::mutex> lock(wrapper->work_mu);
+        while (!wrapper->work_q.empty()) {
+            delete wrapper->work_q.front();
+            wrapper->work_q.pop_front();
+        }
     }
     // Drain server CQ before returning (required by gRPC).
     if (wrapper->cq) {
