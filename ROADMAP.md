@@ -163,7 +163,27 @@ This is the suggested order to reach “common gRPC feature parity” for Lean.
 **Definition of done**
 - Lean supports the common “bring server up later” deployment use case.
 
-### Phase 6 — Scale & Stress
+### Phase 6 — Lean↔Lean Parity Test Suite
+
+Now that the Lean client and Lean server are feature-complete for “common gRPC”, the next milestone is **test parity**: every scenario we currently validate via **Go↔Lean** should have an equivalent **Lean↔Lean** test, so the authoritative coverage does not depend on Go.
+
+**Add APIs (test harness only)**
+- Add an `integrationTests lean` (or equivalent) mode that:
+  - starts the Lean test server in-process/background on an ephemeral port
+  - runs the existing Lean client suite against that server (no Go server required)
+- Refactor the Lean client integration suite so it can target either a Go server or a Lean server (same test cases, different target).
+
+**Add tests (Lean client ↔ Lean server)**
+- Mirror the current Go-involving coverage:
+  - Unary: echo, metadata (request + response headers + trailers), deadlines, cancellation, non-OK status + message, rich details
+  - Streaming (client/server/bidi): headers + trailers, mid-stream cancel, deadline-exceeded, non-OK status (immediate + after N), rich details
+- Keep the existing Go↔Lean suites as **interop smoke/oracle** checks, but ensure Lean↔Lean is the primary correctness signal.
+
+**Definition of done**
+- Every scenario covered today by `Lean client → Go server` and `Go client → Lean server` has an equivalent `Lean client ↔ Lean server` test.
+- `./run-tests.sh` can run the full correctness suite without requiring a Go toolchain (Go tests may remain as an optional/CI interop step).
+
+### Phase 7 — Scale & Stress
 
 **Add tests (targeted, not flaky)**
 - Large unary payload (near configured limits)
@@ -174,7 +194,7 @@ This is the suggested order to reach “common gRPC feature parity” for Lean.
 **Definition of done**
 - No obvious correctness regressions under load; stable resource usage.
 
-### Phase 7 — Interceptors / Middleware Hooks
+### Phase 8 — Interceptors / Middleware Hooks
 
 **Add APIs**
 - Client interceptors (metadata injection, logging/tracing)
