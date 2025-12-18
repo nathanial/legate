@@ -223,6 +223,13 @@ LEAN_EXPORT lean_obj_res legate_server_shutdown_now(b_lean_obj_arg server, lean_
 // Check whether the client has cancelled the call.
 LEAN_EXPORT lean_obj_res legate_server_call_is_cancelled(b_lean_obj_arg call, lean_obj_arg world);
 
+// Send initial metadata (response headers) for a call. Must be called before first response write.
+LEAN_EXPORT lean_obj_res legate_server_call_send_initial_metadata(
+    b_lean_obj_arg call,
+    b_lean_obj_arg metadata,
+    lean_obj_arg world
+);
+
 // Remaining time until deadline in milliseconds, or none if no deadline.
 LEAN_EXPORT lean_obj_res legate_server_call_deadline_remaining_ms(b_lean_obj_arg call, lean_obj_arg world);
 

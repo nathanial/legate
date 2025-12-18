@@ -21,6 +21,15 @@ namespace ServerCall
 def isCancelled (call : ServerCall) : IO Bool :=
   Internal.serverCallIsCancelled call.handle
 
+/-- Send initial metadata (response headers) for this call.
+
+    This is primarily useful for server-streaming and bidi-streaming handlers
+    that need response headers available before the first message is sent.
+    It must be called before sending the first response message.
+-/
+def sendInitialMetadata (call : ServerCall) (headers : Metadata) : IO Unit :=
+  Internal.serverCallSendInitialMetadata call.handle headers
+
 /-- Remaining time until the call deadline (ms), or `none` if no deadline. -/
 def deadlineRemainingMs (call : ServerCall) : IO (Option UInt64) :=
   Internal.serverCallDeadlineRemainingMs call.handle

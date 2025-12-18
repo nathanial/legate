@@ -299,6 +299,13 @@ opaque serverBuilderAddSecureListeningPort
   @[extern "legate_server_call_is_cancelled"]
   opaque serverCallIsCancelled (call : @& ServerCall) : IO Bool
 
+  /-- Send initial metadata (response headers) for a streaming call.
+
+      Must be called before the first response message is written.
+  -/
+  @[extern "legate_server_call_send_initial_metadata"]
+  opaque serverCallSendInitialMetadata (call : @& ServerCall) (metadata : @& Metadata) : IO Unit
+
   /-- Remaining time until deadline (ms), or none if no deadline. -/
   @[extern "legate_server_call_deadline_remaining_ms"]
   opaque serverCallDeadlineRemainingMs (call : @& ServerCall) : IO (Option UInt64)

@@ -16,7 +16,7 @@ cd "$SCRIPT_DIR"
 # Lake doesn't always notice changes in the native (CMake-built) archive when
 # deciding whether to relink Lean dylibs/executables, so do it explicitly here.
 if [ -d "$SCRIPT_DIR/.lake/build/ffi" ]; then
-echo -e "${YELLOW}[0/6] Building native FFI...${NC}"
+    echo -e "${YELLOW}[0/7] Building native FFI...${NC}"
     echo "----------------------------------------"
     cmake --build "$SCRIPT_DIR/.lake/build/ffi" --parallel --target legate_ffi
     # Force relink of Lean shared libs/exes that embed the native archive
@@ -46,7 +46,7 @@ FAILED=0
 # ------------------------------------------------------------------------------
 # Unit Tests (Lean)
 # ------------------------------------------------------------------------------
-echo -e "${YELLOW}[1/6] Running Lean unit tests...${NC}"
+echo -e "${YELLOW}[1/7] Running Lean unit tests...${NC}"
 echo "----------------------------------------"
 
 if lake test; then
@@ -59,100 +59,46 @@ fi
 echo
 
 # ------------------------------------------------------------------------------
-# Integration Tests (Go client -> Go server)
+# Build Lean Integration Test Runner
 # ------------------------------------------------------------------------------
-echo -e "${YELLOW}[2/6] Running Go gRPC integration tests...${NC}"
+echo -e "${YELLOW}[2/7] Building Lean integration tests...${NC}"
 echo "----------------------------------------"
 
-GO_TEST_DIR="$SCRIPT_DIR/Tests/integration/go"
-
-if [ ! -d "$GO_TEST_DIR" ]; then
-    echo -e "${RED}Go integration test directory not found: $GO_TEST_DIR${NC}"
-    FAILED=1
+INTEGRATION_BUILT=0
+if lake build integrationTests 2>&1; then
+    INTEGRATION_BUILT=1
+    echo -e "${GREEN}Lean integration tests built${NC}"
 else
-    cd "$GO_TEST_DIR"
-
-    # Build if needed
-    if [ ! -f "testapp" ] || [ "testapp" -ot "cmd/testapp/main.go" ] || \
-       [ "testapp" -ot "server/server.go" ] || [ "testapp" -ot "client/client.go" ]; then
-        echo "Building Go test application..."
-        export PATH="$PATH:$(go env GOPATH)/bin"
-        make proto build
-    fi
-
-    # Start server in background
-    echo "Starting Go gRPC test server..."
-    ./testapp server -port 50051 &
-    GO_SERVER_PID=$!
-
-    # Wait for server to start
-    sleep 1
-
-    # Check if server started successfully
-    if ! kill -0 $GO_SERVER_PID 2>/dev/null; then
-        echo -e "${RED}Failed to start Go gRPC test server${NC}"
-        FAILED=1
-    else
-        # Run Go client tests
-        echo "Running Go client tests..."
-        if ./testapp client -addr localhost:50051 -test all; then
-            echo -e "${GREEN}Go gRPC integration tests passed${NC}"
-        else
-            echo -e "${RED}Go gRPC integration tests failed${NC}"
-            FAILED=1
-        fi
-    fi
+    echo -e "${RED}Failed to build Lean integration tests${NC}"
+    FAILED=1
 fi
-
-cd "$SCRIPT_DIR"
 
 echo
 
 # ------------------------------------------------------------------------------
-# Cross-Language Tests: Lean client -> Go server
+# Lean↔Lean Parity Tests: Lean client -> Lean server
 # ------------------------------------------------------------------------------
-echo -e "${YELLOW}[3/6] Running Lean client -> Go server tests...${NC}"
+echo -e "${YELLOW}[3/7] Running Lean↔Lean parity tests...${NC}"
 echo "----------------------------------------"
 
-# Build Lean integration tests
-echo "Building Lean integration tests..."
-INTEGRATION_BUILT=0
-if ! lake build integrationTests 2>&1; then
-    echo -e "${RED}Failed to build Lean integration tests${NC}"
-    FAILED=1
-else
-    INTEGRATION_BUILT=1
-    # Check if Go server is still running, if not restart it
-    if ! kill -0 $GO_SERVER_PID 2>/dev/null; then
-        echo "Starting Go server for Lean client tests..."
-        cd "$GO_TEST_DIR"
-        ./testapp server -port 50051 &
-        GO_SERVER_PID=$!
-        sleep 1
-        cd "$SCRIPT_DIR"
-    fi
-
-    # Run Lean client tests against Go server
-    echo "Running Lean client tests against Go server..."
-    if .lake/build/bin/integrationTests client; then
-        echo -e "${GREEN}Lean client -> Go server tests passed${NC}"
+if [ $INTEGRATION_BUILT -eq 1 ]; then
+    if .lake/build/bin/integrationTests lean; then
+        echo -e "${GREEN}Lean↔Lean parity tests passed${NC}"
     else
-        echo -e "${RED}Lean client -> Go server tests failed${NC}"
+        echo -e "${RED}Lean↔Lean parity tests failed${NC}"
         FAILED=1
     fi
+else
+    echo -e "${RED}Skipping Lean↔Lean parity tests (integrationTests failed to build)${NC}"
+    FAILED=1
 fi
-
-# Stop Go server
-echo "Stopping Go gRPC test server..."
-kill $GO_SERVER_PID 2>/dev/null || true
-wait $GO_SERVER_PID 2>/dev/null || true
 
 echo
 
 # ------------------------------------------------------------------------------
 # Lean TLS/mTLS Tests: Lean client <-> Lean server
 # ------------------------------------------------------------------------------
-echo -e "${YELLOW}[4/6] Running Lean TLS/mTLS tests...${NC}"
+echo -e "${YELLOW}[4/7] Running Lean TLS/mTLS tests...${NC}"
 echo "----------------------------------------"
 
 if [ $INTEGRATION_BUILT -eq 1 ]; then
@@ -173,7 +119,7 @@ echo
 # ------------------------------------------------------------------------------
 # Lean WaitForReady Tests: Lean client <-> Lean server
 # ------------------------------------------------------------------------------
-echo -e "${YELLOW}[5/6] Running Lean WaitForReady tests...${NC}"
+echo -e "${YELLOW}[5/7] Running Lean WaitForReady tests...${NC}"
 echo "----------------------------------------"
 
 if [ $INTEGRATION_BUILT -eq 1 ]; then
@@ -192,37 +138,106 @@ fi
 echo
 
 # ------------------------------------------------------------------------------
-# Cross-Language Tests: Go client -> Lean server
+# Optional Go↔Lean Interop: Go client -> Go server, then Lean client -> Go server
 # ------------------------------------------------------------------------------
-echo -e "${YELLOW}[6/6] Running Go client -> Lean server tests...${NC}"
+echo -e "${YELLOW}[6/7] Running Go↔Lean interop tests (optional)...${NC}"
 echo "----------------------------------------"
 
-# Start Lean server
-echo "Starting Lean gRPC server on port 50052..."
-.lake/build/bin/integrationTests server 50052 &
-LEAN_SERVER_PID=$!
-sleep 2
+GO_TEST_DIR="$SCRIPT_DIR/Tests/integration/go"
+HAVE_GO=0
+if [ "${LEGATE_SKIP_GO:-0}" != "1" ] && command -v go >/dev/null 2>&1 && [ -d "$GO_TEST_DIR" ]; then
+    HAVE_GO=1
+fi
 
-# Check if Lean server started successfully
-if ! kill -0 $LEAN_SERVER_PID 2>/dev/null; then
-    echo -e "${RED}Failed to start Lean gRPC server${NC}"
+if [ $HAVE_GO -eq 0 ]; then
+    echo -e "${YELLOW}Skipping Go interop tests (set LEGATE_SKIP_GO=0 and ensure Go toolchain is installed)${NC}"
+else
+    cd "$GO_TEST_DIR"
+
+    # Build if needed
+    if [ ! -f "testapp" ] || [ "testapp" -ot "cmd/testapp/main.go" ] || \
+       [ "testapp" -ot "server/server.go" ] || [ "testapp" -ot "client/client.go" ]; then
+        echo "Building Go test application..."
+        export PATH="$PATH:$(go env GOPATH)/bin"
+        make proto build
+    fi
+
+    echo "Starting Go gRPC test server..."
+    ./testapp server -port 50051 &
+    GO_SERVER_PID=$!
+    sleep 1
+
+    if ! kill -0 $GO_SERVER_PID 2>/dev/null; then
+        echo -e "${RED}Failed to start Go gRPC test server${NC}"
+        FAILED=1
+    else
+        echo "Running Go client tests (Go -> Go server)..."
+        if ./testapp client -addr localhost:50051 -test all; then
+            echo -e "${GREEN}Go client -> Go server tests passed${NC}"
+        else
+            echo -e "${RED}Go client -> Go server tests failed${NC}"
+            FAILED=1
+        fi
+
+        if [ $INTEGRATION_BUILT -eq 1 ]; then
+            echo "Running Lean client tests against Go server..."
+            cd "$SCRIPT_DIR"
+            if .lake/build/bin/integrationTests client; then
+                echo -e "${GREEN}Lean client -> Go server tests passed${NC}"
+            else
+                echo -e "${RED}Lean client -> Go server tests failed${NC}"
+                FAILED=1
+            fi
+            cd "$GO_TEST_DIR"
+        else
+            echo -e "${RED}Skipping Lean client -> Go server tests (integrationTests failed to build)${NC}"
+            FAILED=1
+        fi
+    fi
+
+    echo "Stopping Go gRPC test server..."
+    kill $GO_SERVER_PID 2>/dev/null || true
+    wait $GO_SERVER_PID 2>/dev/null || true
+    cd "$SCRIPT_DIR"
+fi
+
+echo
+
+# ------------------------------------------------------------------------------
+# Optional Go↔Lean Interop: Go client -> Lean server
+# ------------------------------------------------------------------------------
+echo -e "${YELLOW}[7/7] Running Go client -> Lean server tests (optional)...${NC}"
+echo "----------------------------------------"
+
+if [ $HAVE_GO -eq 0 ]; then
+    echo -e "${YELLOW}Skipping Go client -> Lean server tests${NC}"
+elif [ $INTEGRATION_BUILT -ne 1 ]; then
+    echo -e "${RED}Skipping Go client -> Lean server tests (integrationTests failed to build)${NC}"
     FAILED=1
 else
-    # Run Go client tests against Lean server
-    echo "Running Go client tests against Lean server..."
-    cd "$GO_TEST_DIR"
-    if ./testapp client -addr localhost:50052 -test all; then
-        echo -e "${GREEN}Go client -> Lean server tests passed${NC}"
-    else
-        echo -e "${RED}Go client -> Lean server tests failed${NC}"
-        FAILED=1
-    fi
-    cd "$SCRIPT_DIR"
+    echo "Starting Lean gRPC server on port 50052..."
+    .lake/build/bin/integrationTests server 50052 &
+    LEAN_SERVER_PID=$!
+    sleep 2
 
-    # Stop Lean server
-    echo "Stopping Lean gRPC server..."
-    kill $LEAN_SERVER_PID 2>/dev/null || true
-    wait $LEAN_SERVER_PID 2>/dev/null || true
+    if ! kill -0 $LEAN_SERVER_PID 2>/dev/null; then
+        echo -e "${RED}Failed to start Lean gRPC server${NC}"
+        FAILED=1
+    else
+        echo "Running Go client tests against Lean server..."
+        cd "$GO_TEST_DIR"
+        if ./testapp client -addr localhost:50052 -test all; then
+            echo -e "${GREEN}Go client -> Lean server tests passed${NC}"
+        else
+            echo -e "${RED}Go client -> Lean server tests failed${NC}"
+            FAILED=1
+        fi
+        cd "$SCRIPT_DIR"
+
+        echo "Stopping Lean gRPC server..."
+        kill $LEAN_SERVER_PID 2>/dev/null || true
+        wait $LEAN_SERVER_PID 2>/dev/null || true
+    fi
 fi
 
 echo

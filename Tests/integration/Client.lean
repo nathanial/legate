@@ -20,10 +20,10 @@ def expandMethod := "/legate.test.TestService/Expand"
 def biEchoMethod := "/legate.test.TestService/BiEcho"
 
 -- Test configuration
-def serverAddr := "localhost:50051"
+def defaultServerAddr := "localhost:50051"
 
 /-- Test unary Echo RPC with metadata + trailing metadata -/
-def testUnaryMetadata : IO TestResult := do
+def testUnaryMetadata (serverAddr : String) : IO TestResult := do
   let channel ← Channel.createInsecure serverAddr
 
   let request : EchoRequest := { data := "hello".toUTF8 }
@@ -44,7 +44,7 @@ def testUnaryMetadata : IO TestResult := do
     return .failed s!"RPC error: {e}"
 
 /-- Test unary Echo RPC with response headers (initial metadata) -/
-def testUnaryHeaders : IO TestResult := do
+def testUnaryHeaders (serverAddr : String) : IO TestResult := do
   let channel ← Channel.createInsecure serverAddr
 
   let request : EchoRequest := { data := "headers-test".toUTF8 }
@@ -74,7 +74,7 @@ def testUnaryHeaders : IO TestResult := do
     return .failed s!"RPC error: {e}"
 
 /-- Test unary deadlines -/
-def testUnaryDeadlineExceeded : IO TestResult := do
+def testUnaryDeadlineExceeded (serverAddr : String) : IO TestResult := do
   let channel ← Channel.createInsecure serverAddr
 
   let request : EchoRequest := { data := "hello".toUTF8 }
@@ -93,7 +93,7 @@ def testUnaryDeadlineExceeded : IO TestResult := do
       return .failed s!"Expected deadlineExceeded, got {e.code}: {e.message}"
 
 /-- Test unary Echo RPC -/
-def testUnaryEcho : IO TestResult := do
+def testUnaryEcho (serverAddr : String) : IO TestResult := do
   let channel ← Channel.createInsecure serverAddr
 
   -- Create and encode request
@@ -117,7 +117,7 @@ def testUnaryEcho : IO TestResult := do
     return .failed s!"RPC error: {e}"
 
 /-- Test client streaming Collect RPC -/
-def testClientStreamingCollect : IO TestResult := do
+def testClientStreamingCollect (serverAddr : String) : IO TestResult := do
   let channel ← Channel.createInsecure serverAddr
   let opts := (CallOptions.default).withMetadata #[("x-legate-test", "lean")]
 
@@ -155,7 +155,7 @@ def testClientStreamingCollect : IO TestResult := do
     return .failed s!"Start stream error: {e}"
 
 /-- Test server streaming Expand RPC -/
-def testServerStreamingExpand : IO TestResult := do
+def testServerStreamingExpand (serverAddr : String) : IO TestResult := do
   let channel ← Channel.createInsecure serverAddr
   let opts := (CallOptions.default).withMetadata #[("x-legate-test", "lean")]
 
@@ -193,7 +193,7 @@ def testServerStreamingExpand : IO TestResult := do
     return .failed s!"Start stream error: {e}"
 
 /-- Test bidirectional streaming BiEcho RPC -/
-def testBidiStreaming : IO TestResult := do
+def testBidiStreaming (serverAddr : String) : IO TestResult := do
   let channel ← Channel.createInsecure serverAddr
   let opts := (CallOptions.default).withMetadata #[("x-legate-test", "lean")]
 
@@ -248,7 +248,7 @@ def testBidiStreaming : IO TestResult := do
     return .failed s!"Start stream error: {e}"
 
 /-- Test server streaming with headers -/
-def testServerStreamingHeaders : IO TestResult := do
+def testServerStreamingHeaders (serverAddr : String) : IO TestResult := do
   let channel ← Channel.createInsecure serverAddr
   let opts := (CallOptions.default).withMetadata #[("x-legate-test", "stream-header")]
 
@@ -281,7 +281,7 @@ def testServerStreamingHeaders : IO TestResult := do
     return .failed s!"Start stream error: {e}"
 
 /-- Test server streaming cancellation: cancel after receiving a few messages -/
-def testServerStreamingCancel : IO TestResult := do
+def testServerStreamingCancel (serverAddr : String) : IO TestResult := do
   let channel ← Channel.createInsecure serverAddr
 
   -- Request many messages with a delay to allow cancellation
@@ -333,7 +333,7 @@ def testServerStreamingCancel : IO TestResult := do
     return .failed s!"Start stream error: {e}"
 
 /-- Test server streaming deadline exceeded during active streaming -/
-def testServerStreamingDeadline : IO TestResult := do
+def testServerStreamingDeadline (serverAddr : String) : IO TestResult := do
   let channel ← Channel.createInsecure serverAddr
 
   -- Request many messages with delay, but with a short timeout
@@ -376,7 +376,7 @@ def testServerStreamingDeadline : IO TestResult := do
       return .failed s!"Start stream error: {e}"
 
 /-- Test client streaming cancellation: cancel after sending some messages -/
-def testClientStreamingCancel : IO TestResult := do
+def testClientStreamingCancel (serverAddr : String) : IO TestResult := do
   let channel ← Channel.createInsecure serverAddr
 
   match ← clientStreamingCall channel collectMethod with
@@ -396,7 +396,7 @@ def testClientStreamingCancel : IO TestResult := do
     | .ok _ =>
       -- It's possible the cancel didn't take effect immediately
       return .passed
-    | .error e =>
+    | .error _ =>
       -- Any error after cancel is acceptable
       return .passed
 
@@ -404,7 +404,7 @@ def testClientStreamingCancel : IO TestResult := do
     return .failed s!"Start stream error: {e}"
 
 /-- Test bidirectional streaming cancellation: cancel mid-exchange -/
-def testBidiStreamingCancel : IO TestResult := do
+def testBidiStreamingCancel (serverAddr : String) : IO TestResult := do
   let channel ← Channel.createInsecure serverAddr
   let opts := (CallOptions.default).withMetadata #[("x-delay-ms", "50")]
 
@@ -440,7 +440,7 @@ def testBidiStreamingCancel : IO TestResult := do
     return .failed s!"Start stream error: {e}"
 
 /-- Test client streaming deadline exceeded -/
-def testClientStreamingDeadline : IO TestResult := do
+def testClientStreamingDeadline (serverAddr : String) : IO TestResult := do
   let channel ← Channel.createInsecure serverAddr
   let opts := ((CallOptions.default).withTimeout 100).withMetadata #[("x-delay-ms", "50")]
 
@@ -481,7 +481,7 @@ def testClientStreamingDeadline : IO TestResult := do
       return .failed s!"Start stream error: {e}"
 
 /-- Test bidirectional streaming deadline exceeded -/
-def testBidiStreamingDeadline : IO TestResult := do
+def testBidiStreamingDeadline (serverAddr : String) : IO TestResult := do
   let channel ← Channel.createInsecure serverAddr
   let opts := ((CallOptions.default).withTimeout 100).withMetadata #[("x-delay-ms", "50")]
 
@@ -530,7 +530,7 @@ def testBidiStreamingDeadline : IO TestResult := do
 -- ============================================================================
 
 /-- Test unary error response -/
-def testUnaryError : IO TestResult := do
+def testUnaryError (serverAddr : String) : IO TestResult := do
   let channel ← Channel.createInsecure serverAddr
 
   let request : EchoRequest := { data := "test".toUTF8 }
@@ -548,7 +548,7 @@ def testUnaryError : IO TestResult := do
       return .failed s!"Expected invalidArgument with message, got {e.code}: {e.message}"
 
 /-- Test server streaming error immediately (before any messages) -/
-def testServerStreamingError : IO TestResult := do
+def testServerStreamingError (serverAddr : String) : IO TestResult := do
   let channel ← Channel.createInsecure serverAddr
 
   let request : ExpandRequest := { count := 5, prefix_ := "test".toUTF8 }
@@ -581,7 +581,7 @@ def testServerStreamingError : IO TestResult := do
       return .failed s!"Expected alreadyExists error, got {e.code}: {e.message}"
 
 /-- Test server streaming error mid-stream (after some messages) -/
-def testServerStreamingMidError : IO TestResult := do
+def testServerStreamingMidError (serverAddr : String) : IO TestResult := do
   let channel ← Channel.createInsecure serverAddr
 
   -- Request 10 messages but error after 3
@@ -621,7 +621,7 @@ def testServerStreamingMidError : IO TestResult := do
     return .failed s!"Start stream error: {e}"
 
 /-- Test client streaming error immediately (before any messages) -/
-def testClientStreamingError : IO TestResult := do
+def testClientStreamingError (serverAddr : String) : IO TestResult := do
   let channel ← Channel.createInsecure serverAddr
 
   -- Request error code 7 (PermissionDenied) with message
@@ -647,7 +647,7 @@ def testClientStreamingError : IO TestResult := do
       return .failed s!"Expected permissionDenied error, got {e.code}: {e.message}"
 
 /-- Test client streaming error mid-stream (after some messages) -/
-def testClientStreamingMidError : IO TestResult := do
+def testClientStreamingMidError (serverAddr : String) : IO TestResult := do
   let channel ← Channel.createInsecure serverAddr
 
   -- Error after receiving 2 messages
@@ -673,7 +673,7 @@ def testClientStreamingMidError : IO TestResult := do
     return .failed s!"Start stream error: {e}"
 
 /-- Test bidirectional streaming error immediately (before any messages) -/
-def testBidiStreamingError : IO TestResult := do
+def testBidiStreamingError (serverAddr : String) : IO TestResult := do
   let channel ← Channel.createInsecure serverAddr
 
   -- Request error code 8 (ResourceExhausted) with message
@@ -706,7 +706,7 @@ def testBidiStreamingError : IO TestResult := do
       return .failed s!"Expected resourceExhausted error, got {e.code}: {e.message}"
 
 /-- Test bidirectional streaming error mid-stream (after some messages) -/
-def testBidiStreamingMidError : IO TestResult := do
+def testBidiStreamingMidError (serverAddr : String) : IO TestResult := do
   let channel ← Channel.createInsecure serverAddr
 
   -- Error after processing 2 messages
@@ -745,29 +745,33 @@ def testBidiStreamingMidError : IO TestResult := do
   | .error e =>
     return .failed s!"Start stream error: {e}"
 
-/-- Client test suite -/
-def clientTestSuite : TestSuite := suite "Lean Client -> Go Server" #[
-  test "Unary Echo" testUnaryEcho,
-  test "Unary Metadata" testUnaryMetadata,
-  test "Unary Headers" testUnaryHeaders,
-  test "Unary Deadline" testUnaryDeadlineExceeded,
-  test "Unary Error" testUnaryError,
-  test "Client Streaming Collect" testClientStreamingCollect,
-  test "Client Streaming Error" testClientStreamingError,
-  test "Client Streaming MidError" testClientStreamingMidError,
-  test "Server Streaming Expand" testServerStreamingExpand,
-  test "Server Streaming Headers" testServerStreamingHeaders,
-  test "Server Streaming Error" testServerStreamingError,
-  test "Server Streaming MidError" testServerStreamingMidError,
-  test "Bidirectional BiEcho" testBidiStreaming,
-  test "Bidi Streaming Error" testBidiStreamingError,
-  test "Bidi Streaming MidError" testBidiStreamingMidError,
-  test "Server Streaming Cancel" testServerStreamingCancel,
-  test "Server Streaming Deadline" testServerStreamingDeadline,
-  test "Client Streaming Cancel" testClientStreamingCancel,
-  test "Bidi Streaming Cancel" testBidiStreamingCancel,
-  test "Client Streaming Deadline" testClientStreamingDeadline,
-  test "Bidi Streaming Deadline" testBidiStreamingDeadline
+/-- Client integration suite against a specific server address. -/
+def mkClientTestSuite (name : String) (serverAddr : String) : TestSuite := suite name #[
+  test "Unary Echo" (testUnaryEcho serverAddr),
+  test "Unary Metadata" (testUnaryMetadata serverAddr),
+  test "Unary Headers" (testUnaryHeaders serverAddr),
+  test "Unary Deadline" (testUnaryDeadlineExceeded serverAddr),
+  test "Unary Error" (testUnaryError serverAddr),
+  test "Client Streaming Collect" (testClientStreamingCollect serverAddr),
+  test "Client Streaming Error" (testClientStreamingError serverAddr),
+  test "Client Streaming MidError" (testClientStreamingMidError serverAddr),
+  test "Server Streaming Expand" (testServerStreamingExpand serverAddr),
+  test "Server Streaming Headers" (testServerStreamingHeaders serverAddr),
+  test "Server Streaming Error" (testServerStreamingError serverAddr),
+  test "Server Streaming MidError" (testServerStreamingMidError serverAddr),
+  test "Bidirectional BiEcho" (testBidiStreaming serverAddr),
+  test "Bidi Streaming Error" (testBidiStreamingError serverAddr),
+  test "Bidi Streaming MidError" (testBidiStreamingMidError serverAddr),
+  test "Server Streaming Cancel" (testServerStreamingCancel serverAddr),
+  test "Server Streaming Deadline" (testServerStreamingDeadline serverAddr),
+  test "Client Streaming Cancel" (testClientStreamingCancel serverAddr),
+  test "Bidi Streaming Cancel" (testBidiStreamingCancel serverAddr),
+  test "Client Streaming Deadline" (testClientStreamingDeadline serverAddr),
+  test "Bidi Streaming Deadline" (testBidiStreamingDeadline serverAddr)
 ]
+
+/-- Backwards-compatible suite name for Go oracle server. -/
+def clientTestSuite : TestSuite :=
+  mkClientTestSuite "Lean Client -> Go Server" defaultServerAddr
 
 end Tests.integration.Client

@@ -109,7 +109,8 @@ struct ServerIOState {
 
 struct ServerCallWrapper {
     grpc::GenericServerContext* ctx = nullptr;  // non-owning
-    explicit ServerCallWrapper(grpc::GenericServerContext* c) : ctx(c) {}
+    ServerCallContext* call_ctx = nullptr;      // non-owning
+    ServerCallWrapper(grpc::GenericServerContext* c, ServerCallContext* cc) : ctx(c), call_ctx(cc) {}
 };
 
 // Server-side types
@@ -188,17 +189,7 @@ struct ServerWrapper {
         return nullptr;
     }
 
-    ~ServerWrapper() {
-        if (running.load()) {
-            running.store(false);
-            if (server) server->Shutdown();
-            if (cq) cq->Shutdown();
-            if (polling_thread.joinable()) {
-                polling_thread.join();
-            }
-        }
-        // Handlers are cleaned up by their destructors
-    }
+    ~ServerWrapper();
 };
 
 // Server call context for tracking async operations
@@ -212,10 +203,37 @@ struct ServerCallContext {
     int tag_read = 0;
     int tag_write = 0;
     int tag_finish = 0;
+    int tag_done = 0;
+    int tag_send_initial_metadata = 0;
+    bool initial_metadata_sent = false;
 
     explicit ServerCallContext(ServerWrapper* s)
         : stream(&ctx), server(s), handler(nullptr) {}
 };
+
+ServerWrapper::~ServerWrapper() {
+    // Always try to shut down and drain, even if the user already called
+    // `legate_server_shutdown`, to ensure gRPC's CQ destructor invariants.
+    running.store(false);
+    if (server) server->Shutdown();
+    if (cq) cq->Shutdown();
+    if (polling_thread.joinable()) {
+        polling_thread.join();
+    }
+    // Drain server CQ before destruction (required by gRPC).
+    if (cq) {
+        void* tag = nullptr;
+        bool ok = false;
+        while (cq->Next(&tag, &ok)) {
+            delete static_cast<ServerCallContext*>(tag);
+        }
+    }
+    // Release resources now (and in a safe order) rather than relying on member
+    // destruction order, which can interact poorly with gRPC CQ invariants.
+    server.reset();
+    cq.reset();
+    // Handlers are cleaned up by their destructors
+}
 
 // ============================================================================
 // Finalizers for Lean GC
@@ -421,6 +439,39 @@ extern "C" LEAN_EXPORT lean_obj_res legate_server_call_is_cancelled(
     return mk_io_result_ok(lean_box(cancelled ? 1 : 0));
 }
 
+extern "C" LEAN_EXPORT lean_obj_res legate_server_call_send_initial_metadata(
+    b_lean_obj_arg call,
+    b_lean_obj_arg metadata,
+    lean_obj_arg /* world */
+) {
+    auto* wrapper = static_cast<ServerCallWrapper*>(lean_get_external_data(call));
+    if (!wrapper || !wrapper->ctx || !wrapper->call_ctx) {
+        return mk_io_result_ok(lean_box(0));
+    }
+
+    auto* call_ctx = wrapper->call_ctx;
+    if (call_ctx->initial_metadata_sent) {
+        return mk_io_result_ok(lean_box(0));
+    }
+
+    // Add initial metadata entries.
+    size_t len = lean_array_size(metadata);
+    for (size_t i = 0; i < len; i++) {
+        lean_object* pair = lean_array_get_core(metadata, i);
+        lean_object* key = lean_ctor_get(pair, 0);
+        lean_object* val = lean_ctor_get(pair, 1);
+        wrapper->ctx->AddInitialMetadata(lean_string_to_std(key), lean_string_to_std(val));
+    }
+
+    // Send initial metadata on the stream.
+    void* expected = &call_ctx->tag_send_initial_metadata;
+    call_ctx->stream.SendInitialMetadata(expected);
+    bool ok = false;
+    cq_wait_for_tag(call_ctx->call_cq, expected, &ok);
+    call_ctx->initial_metadata_sent = true;
+    return mk_io_result_ok(lean_box(0));
+}
+
 extern "C" LEAN_EXPORT lean_obj_res legate_server_call_deadline_remaining_ms(
     b_lean_obj_arg call,
     lean_obj_arg /* world */
@@ -484,6 +535,9 @@ static lean_obj_res legate_server_send_impl(
     if (!state->call_ctx) {
         return mk_io_result_ok(lean_box(0));
     }
+
+    // A write will trigger initial metadata to be sent if it hasn't been already.
+    state->call_ctx->initial_metadata_sent = true;
 
     grpc::ByteBuffer buf = lean_bytearray_to_bytebuffer(data);
     if (debug_server_io_enabled()) {
@@ -1415,7 +1469,10 @@ static void handle_server_call(ServerCallContext* call_ctx) {
         return;
     }
 
-    auto* call_wrapper = new ServerCallWrapper(&call_ctx->ctx);
+    // Ensure cancellation status can be queried safely via ServerContext::IsCancelled().
+    call_ctx->ctx.AsyncNotifyWhenDone(&call_ctx->tag_done);
+
+    auto* call_wrapper = new ServerCallWrapper(&call_ctx->ctx, call_ctx);
     lean_object* call_obj = lean_alloc_external(g_server_call_class, call_wrapper);
     // Keep the external object alive even if the Lean handler doesn't use it.
     // Otherwise the finalizer may delete call_wrapper early, and we'd write to
@@ -1609,9 +1666,15 @@ static void handle_server_call(ServerCallContext* call_ctx) {
             lean_object* headers = lean_ctor_get(ok_value, 0);
             lean_object* trailers = lean_ctor_get(ok_value, 1);
 
-            // Apply initial metadata (response headers)
-            // Note: For streaming, headers are sent with the first message if not already sent
-            apply_initial_metadata(&call_ctx->ctx, headers);
+            // Apply initial metadata (response headers) if no write has triggered it yet.
+            if (!call_ctx->initial_metadata_sent) {
+                apply_initial_metadata(&call_ctx->ctx, headers);
+                void* expected = &call_ctx->tag_send_initial_metadata;
+                call_ctx->stream.SendInitialMetadata(expected);
+                bool ok = false;
+                cq_wait_for_tag(call_ctx->call_cq, expected, &ok);
+                call_ctx->initial_metadata_sent = true;
+            }
             // Apply trailing metadata
             apply_trailing_metadata(&call_ctx->ctx, trailers);
             lean_dec(ok_value);
@@ -1667,9 +1730,15 @@ static void handle_server_call(ServerCallContext* call_ctx) {
             lean_object* headers = lean_ctor_get(ok_value, 0);
             lean_object* trailers = lean_ctor_get(ok_value, 1);
 
-            // Apply initial metadata (response headers)
-            // Note: For streaming, headers are sent with the first message if not already sent
-            apply_initial_metadata(&call_ctx->ctx, headers);
+            // Apply initial metadata (response headers) if no write has triggered it yet.
+            if (!call_ctx->initial_metadata_sent) {
+                apply_initial_metadata(&call_ctx->ctx, headers);
+                void* expected = &call_ctx->tag_send_initial_metadata;
+                call_ctx->stream.SendInitialMetadata(expected);
+                bool ok = false;
+                cq_wait_for_tag(call_ctx->call_cq, expected, &ok);
+                call_ctx->initial_metadata_sent = true;
+            }
             // Apply trailing metadata
             apply_trailing_metadata(&call_ctx->ctx, trailers);
             lean_dec(ok_value);
@@ -1925,6 +1994,10 @@ extern "C" LEAN_EXPORT lean_obj_res legate_server_start(
 ) {
     auto* wrapper = static_cast<ServerWrapper*>(lean_get_external_data(server));
 
+    if (!wrapper->server || !wrapper->cq) {
+        return mk_io_error("Server has been shut down");
+    }
+
     if (wrapper->running.load()) {
         return mk_io_result_ok(lean_box(0));
     }
@@ -1996,6 +2069,17 @@ extern "C" LEAN_EXPORT lean_obj_res legate_server_shutdown(
     if (wrapper->polling_thread.joinable()) {
         wrapper->polling_thread.join();
     }
+    // Drain server CQ before returning (required by gRPC).
+    if (wrapper->cq) {
+        void* tag = nullptr;
+        bool ok = false;
+        while (wrapper->cq->Next(&tag, &ok)) {
+            delete static_cast<ServerCallContext*>(tag);
+        }
+    }
+    // Prevent accidental restart of a shut down server.
+    wrapper->server.reset();
+    wrapper->cq.reset();
 
     return mk_io_result_ok(lean_box(0));
 }

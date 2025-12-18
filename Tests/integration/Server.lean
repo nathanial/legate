@@ -27,6 +27,17 @@ def maybeSleepFromMetadata (ctx : ServerContext) : IO Unit := do
     | none => pure ()
   | none => pure ()
 
+def delayMsFromMetadata (ctx : ServerContext) : Option Nat :=
+  ctx.metadata.get? "x-delay-ms" |>.bind String.toNat?
+
+def errorAfterNFromMetadata (ctx : ServerContext) : Option Nat :=
+  ctx.metadata.get? "x-error-after-n" |>.bind String.toNat?
+
+def maybeDelayFromMetadata (ctx : ServerContext) : IO Unit := do
+  match delayMsFromMetadata ctx with
+  | none => pure ()
+  | some ms => IO.sleep (UInt32.ofNat ms)
+
 def maybeWaitForCancel (ctx : ServerContext) : IO Bool := do
   match ctx.metadata.get? "x-wait-cancel" with
   | none => return false
@@ -94,18 +105,26 @@ def handleCollect (ctx : ServerContext) (recv : IO (Option ByteArray))
   if let some e := maybeReturnError ctx then
     return .error { e with details := maybeGetErrorDetails ctx }
 
+  let errorAfterN := errorAfterNFromMetadata ctx
+
   -- Read all messages using a loop
   let mut parts : Array ByteArray := #[]
   let mut count : Int32 := 0
   let mut done := false
   while !done do
+    if (← ctx.call.isCancelled) then
+      return .error (GrpcError.mk .cancelled "Cancelled" none)
     match ← recv with
     | some bytes =>
       match Protolean.decodeMessage (α := CollectRequest) bytes with
       | .ok request =>
         parts := parts.push request.data
         count := count + 1
+        if let some n := errorAfterN then
+          if parts.size >= n then
+            return .error (GrpcError.mk .aborted s!"error after {parts.size} messages" none)
       | .error _ => pure ()  -- Skip malformed messages
+      maybeDelayFromMetadata ctx
     | none => done := true
 
   -- Join with "|"
@@ -128,10 +147,19 @@ def handleExpand (ctx : ServerContext) (requestBytes : ByteArray) (send : ByteAr
 
   match Protolean.decodeMessage (α := ExpandRequest) requestBytes with
   | .ok request =>
+    -- Send initial metadata (response headers) before the first message
+    ctx.call.sendInitialMetadata (testHeaders ctx)
+    let errorAfterN := errorAfterNFromMetadata ctx
     for i in [:request.count.toInt.toNat] do
+      if (← ctx.call.isCancelled) then
+        return .error (GrpcError.mk .cancelled "Cancelled" none)
+      if let some n := errorAfterN then
+        if i >= n then
+          return .error (GrpcError.mk .aborted s!"error after {i} messages" none)
       let data := s!"{String.fromUTF8! request.prefix_}:{i}".toUTF8
       let response : ExpandResponse := { data := data, sequence := i.toInt32 }
       send (Protolean.encodeMessage response)
+      maybeDelayFromMetadata ctx
     -- Return (headers, trailers)
     return .ok (testHeaders ctx, testTrailers ctx)
   | .error e =>
@@ -146,22 +174,45 @@ def handleBiEcho (ctx : ServerContext) (recv : IO (Option ByteArray)) (send : By
   if let some e := maybeReturnError ctx then
     return .error { e with details := maybeGetErrorDetails ctx }
 
+  -- Send initial metadata (response headers) before the first message
+  ctx.call.sendInitialMetadata (testHeaders ctx)
+  let errorAfterN := errorAfterNFromMetadata ctx
+
   let mut seq : Int32 := 0
   let mut done := false
   while !done do
+    if (← ctx.call.isCancelled) then
+      return .error (GrpcError.mk .cancelled "Cancelled" none)
     match ← recv with
     | some bytes =>
       match Protolean.decodeMessage (α := BiEchoRequest) bytes with
       | .ok request =>
+        if let some n := errorAfterN then
+          if seq.toInt.toNat >= n then
+            return .error (GrpcError.mk .aborted s!"error after {seq} messages" none)
         let data := s!"{seq}:{String.fromUTF8! request.data}".toUTF8
         let response : BiEchoResponse := { data := data, sequence := seq }
         send (Protolean.encodeMessage response)
         seq := seq + 1
+        maybeDelayFromMetadata ctx
       | .error _ => pure ()  -- Skip malformed
     | none => done := true
 
   -- Return (headers, trailers)
   return .ok (testHeaders ctx, testTrailers ctx)
+
+/-- Start the Lean TestService server on an ephemeral port, returning (server, port). -/
+def startTestServer : IO (Server × UInt32) := do
+  let builder ← ServerBuilder.new
+  let port ← builder.addInsecurePort "127.0.0.1:0"
+  builder.registerUnary "/legate.test.TestService/Echo" handleEcho
+  builder.registerClientStreaming "/legate.test.TestService/Collect" handleCollect
+  builder.registerServerStreaming "/legate.test.TestService/Expand" handleExpand
+  builder.registerBidiStreaming "/legate.test.TestService/BiEcho" handleBiEcho
+  let server ← builder.build
+  server.start
+  IO.sleep 100
+  return (server, port)
 
 /-- Start the Lean TestService server -/
 def runTestServer (port : Nat := 50051) : IO Unit := do
