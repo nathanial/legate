@@ -2,65 +2,64 @@
   Tests for Legate.Status module
 -/
 
+import Crucible
 import Legate.Status
-import Tests.Framework
 
-open Tests
+open Crucible
 open Legate
 
 namespace Tests.StatusTests
 
-def testStatusOk : TestCase := test "Status.ok" do
+/-- Check if a string contains a substring -/
+def String.containsSubstr (s : String) (sub : String) : Bool :=
+  (s.splitOn sub).length > 1
+
+testSuite "Status Tests"
+
+test "Status ok" := do
   let s := Status.ok
-  if s.code != .ok then return .failed "code should be ok"
-  if s.message != "" then return .failed "message should be empty"
-  if !s.isOk then return .failed "isOk should return true"
-  if s.isError then return .failed "isError should return false"
-  return .passed
+  ensure (s.code == .ok) "code should be ok"
+  ensure (s.message == "") "message should be empty"
+  ensure s.isOk "isOk should return true"
+  ensure (!s.isError) "isError should return false"
 
-def testStatusMake : TestCase := test "Status.make" do
+test "Status make" := do
   let s := Status.make .notFound "Resource not found"
-  if s.code != .notFound then return .failed "code mismatch"
-  if s.message != "Resource not found" then return .failed "message mismatch"
-  return .passed
+  ensure (s.code == .notFound) "code mismatch"
+  ensure (s.message == "Resource not found") "message mismatch"
 
-def testStatusMakeNoMessage : TestCase := test "Status.make without message" do
+test "Status make without message" := do
   let s := Status.make .internal
-  if s.code != .internal then return .failed "code mismatch"
-  if s.message != "" then return .failed "message should be empty"
-  return .passed
+  ensure (s.code == .internal) "code mismatch"
+  ensure (s.message == "") "message should be empty"
 
-def testStatusIsOk : TestCase := test "Status.isOk" do
+test "Status isOk" := do
   let okStatus := Status.ok
   let errStatus := Status.make .unavailable "Server unavailable"
-  if !okStatus.isOk then return .failed "ok status should be ok"
-  if errStatus.isOk then return .failed "error status should not be ok"
-  return .passed
+  ensure okStatus.isOk "ok status should be ok"
+  ensure (!errStatus.isOk) "error status should not be ok"
 
-def testStatusIsError : TestCase := test "Status.isError" do
+test "Status isError" := do
   let okStatus := Status.ok
   let errStatus := Status.make .internal "Error"
-  if okStatus.isError then return .failed "ok status should not be error"
-  if !errStatus.isError then return .failed "error status should be error"
-  return .passed
+  ensure (!okStatus.isError) "ok status should not be error"
+  ensure errStatus.isError "error status should be error"
 
-def testStatusToError : TestCase := test "Status.toError" do
+test "Status toError" := do
   let okStatus := Status.ok
   let errStatus := Status.make .cancelled "Cancelled"
 
   match okStatus.toError with
-  | some _ => return .failed "ok status should not convert to error"
+  | some _ => ensure false "ok status should not convert to error"
   | none => pure ()
 
   match errStatus.toError with
   | some e =>
-    if e.code != .cancelled then return .failed "error code mismatch"
-    if e.message != "Cancelled" then return .failed "error message mismatch"
-  | none => return .failed "error status should convert to error"
+    ensure (e.code == .cancelled) "error code mismatch"
+    ensure (e.message == "Cancelled") "error message mismatch"
+  | none => ensure false "error status should convert to error"
 
-  return .passed
-
-def testStatusToResult : TestCase := test "Status.toResult" do
+test "Status toResult" := do
   let okStatus := Status.ok
   let errStatus := Status.make .notFound "Not found"
 
@@ -68,55 +67,37 @@ def testStatusToResult : TestCase := test "Status.toResult" do
   let errResult := errStatus.toResult "unused"
 
   match okResult with
-  | .ok v => if v != "success" then return .failed "ok result value mismatch"
-  | .error _ => return .failed "ok status should produce ok result"
+  | .ok v => ensure (v == "success") "ok result value mismatch"
+  | .error _ => ensure false "ok status should produce ok result"
 
   match errResult with
-  | .ok _ => return .failed "error status should produce error result"
+  | .ok _ => ensure false "error status should produce error result"
   | .error e =>
-    if e.code != .notFound then return .failed "error result code mismatch"
-    if e.message != "Not found" then return .failed "error result message mismatch"
+    ensure (e.code == .notFound) "error result code mismatch"
+    ensure (e.message == "Not found") "error result message mismatch"
 
-  return .passed
-
-def testStatusToString : TestCase := test "Status ToString" do
+test "Status ToString" := do
   let s1 := Status.ok
   let s2 := Status.make .internal "Something went wrong"
 
   let str1 := toString s1
-  if !str1.containsSubstr "OK" then return .failed "ok toString should contain OK"
+  ensure (String.containsSubstr str1 "OK") "ok toString should contain OK"
 
   let str2 := toString s2
-  if !str2.containsSubstr "Internal" then return .failed "error toString should contain code"
-  if !str2.containsSubstr "Something went wrong" then return .failed "error toString should contain message"
+  ensure (String.containsSubstr str2 "Internal") "error toString should contain code"
+  ensure (String.containsSubstr str2 "Something went wrong") "error toString should contain message"
 
-  return .passed
-
-def testStatusEquality : TestCase := test "Status equality" do
+test "Status equality" := do
   let s1 := Status.make .ok ""
   let s2 := Status.ok
   let s3 := Status.make .internal "Error"
   let s4 := Status.make .internal "Error"
   let s5 := Status.make .internal "Different"
 
-  if s1 != s2 then return .failed "equivalent ok statuses should be equal"
-  if s3 != s4 then return .failed "same error statuses should be equal"
-  if s3 == s5 then return .failed "different messages should not be equal"
+  ensure (s1 == s2) "equivalent ok statuses should be equal"
+  ensure (s3 == s4) "same error statuses should be equal"
+  ensure (s3 != s5) "different messages should not be equal"
 
-  return .passed
-
--- Test suite
-
-def statusTestSuite : TestSuite := suite "Status Tests" #[
-  testStatusOk,
-  testStatusMake,
-  testStatusMakeNoMessage,
-  testStatusIsOk,
-  testStatusIsError,
-  testStatusToError,
-  testStatusToResult,
-  testStatusToString,
-  testStatusEquality
-]
+#generate_tests
 
 end Tests.StatusTests

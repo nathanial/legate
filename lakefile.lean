@@ -5,6 +5,7 @@ package legate where
   precompileModules := true
 
 require protolean from git "https://github.com/nathanial/protolean" @ "master"
+require crucible from git "https://github.com/nathanial/crucible" @ "master"
 
 -- FFI and gRPC link arguments
 def ffiBuildDir := ".lake/build/ffi"
@@ -67,7 +68,7 @@ lean_lib Legate where
 -- Tests library - modules that contain the actual tests
 lean_lib Tests where
   srcDir := "."
-  roots := #[`Tests.Framework, `Tests.ErrorTests, `Tests.MetadataTests, `Tests.StatusTests]
+  roots := #[`Tests.ErrorTests, `Tests.MetadataTests, `Tests.StatusTests]
   moreLinkArgs := #["-L.lake/build/lib", "-lLegate"] ++ ffiLinkArgs
 
 -- Test executable (build tests and run with `lake test`)
