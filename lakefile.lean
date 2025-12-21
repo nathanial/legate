@@ -4,8 +4,8 @@ open Lake DSL System
 package legate where
   precompileModules := true
 
-require protolean from git "https://github.com/nathanial/protolean" @ "master"
-require crucible from git "https://github.com/nathanial/crucible" @ "master"
+require protolean from ".." / "protolean"
+require crucible from ".." / "crucible"
 
 -- FFI and gRPC link arguments
 def ffiBuildDir := ".lake/build/ffi"
