@@ -4,8 +4,8 @@ open Lake DSL System
 package legate where
   version := v!"0.1.0"
 
-require protolean from ".." / "protolean"
-require crucible from ".." / "crucible"
+require protolean from git "https://github.com/nathanial/protolean" @ "v0.0.1"
+require crucible from git "https://github.com/nathanial/crucible" @ "v0.0.1"
 
 -- FFI and gRPC link arguments using system gRPC from Homebrew
 def ffiBuildDir := ".lake/build/ffi"
