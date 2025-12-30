@@ -17,4 +17,6 @@
 # CMake build directories (if building outside of Lake)
 /ffi/build/
 
-testapp
+testapplake-manifest.json
+.lake
+lake-manifest.json
